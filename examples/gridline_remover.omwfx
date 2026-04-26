@@ -1,0 +1,85 @@
+
+render_target RT_NoMipmap {
+    internal_format = rgba;
+    source_type = int;
+    source_format = rgba;
+    mipmaps = false;
+    min_filter = nearest;
+    mag_filter = nearest;
+}
+
+fragment x() {
+    omw_In vec2 omw_TexCoord;
+    void main()
+    {
+        vec2 uv = omw_TexCoord;
+        vec2 px = omw.rcpResolution;
+        vec2 px_x = vec2(px.x, 0.0);
+        vec2 px_y = vec2(0.0, px.y);
+
+        vec3 q = texture2D(omw_SamplerLastShader, uv).rgb;
+        
+        vec3 a = texture2D(omw_SamplerLastShader, uv + px_x * 2.0).rgb;
+        vec3 b = texture2D(omw_SamplerLastShader, uv + px_x).rgb;
+        vec3 c = texture2D(omw_SamplerLastShader, uv - px_x).rgb;
+        vec3 d = texture2D(omw_SamplerLastShader, uv - px_x * 2.0).rgb;
+        
+        vec3 A = a * 0.5 - b + q - c + d * 0.5;
+        vec3 B = a * -0.5 + q + d * -0.5;
+        
+        A = abs(A);
+        B = abs(B);
+        
+        vec3 _max = max(q, max(a, max(b, max(c, d))));
+        vec3 _min = min(q, min(a, min(b, min(c, d))));
+        
+        vec3 mag = _max - _min + 0.01;
+        
+        vec3 ret = q*0.5 + b*0.25 + c*0.25;
+        
+        ret = mix(q, ret, clamp((A-B)/mag, 0.0, 1.0));
+
+        omw_FragColor.rgb = ret;
+    }
+}
+
+fragment y() {
+    omw_In vec2 omw_TexCoord;
+    void main()
+    {
+        vec2 uv = omw_TexCoord;
+        vec2 px = omw.rcpResolution;
+        px = vec2(0.0, px.y);
+
+        vec3 q = texture2D(omw_SamplerLastPass, uv).rgb;
+        
+        vec3 a = texture2D(omw_SamplerLastPass, uv + px * 2.0).rgb;
+        vec3 b = texture2D(omw_SamplerLastPass, uv + px).rgb;
+        vec3 c = texture2D(omw_SamplerLastPass, uv - px).rgb;
+        vec3 d = texture2D(omw_SamplerLastPass, uv - px * 2.0).rgb;
+        
+        vec3 A = a * 0.5 - b + q - c + d * 0.5;
+        vec3 B = a * -0.5 + q + d * -0.5;
+        
+        A = abs(A);
+        B = abs(B);
+        
+        vec3 _max = max(q, max(a, max(b, max(c, d))));
+        vec3 _min = min(q, min(a, min(b, min(c, d))));
+        
+        vec3 mag = _max - _min + 0.01;
+        
+        vec3 ret = q*0.5 + b*0.25 + c*0.25;
+        
+        ret = mix(q, ret, clamp((A-B)/mag*2.0, 0.0, 1.0));
+
+        omw_FragColor.rgb = ret;
+    }
+}
+
+technique {
+    passes = x, y;
+    description = "....";
+    author = "Wareya";
+    version = "1.0";
+}

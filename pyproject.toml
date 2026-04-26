@@ -1,0 +1,19 @@
+[project]
+name = "upscaler"
+version = "0.1.0"
+requires-python = "==3.10.*"
+dependencies = [
+    "torch-directml==0.2.0dev230426",
+    #"torch>=2.4.0",
+    "pillow>=10.0.0",
+    "numpy==1.23.*",
+    "safetensors>=0.8.0rc0",
+    "tqdm>=4.66.0",
+    "packaging>=26.0",
+    "scipy>=1.15.3",
+]
+
+[tool.uv.workspace]
+members = [
+    "fsr",
+]

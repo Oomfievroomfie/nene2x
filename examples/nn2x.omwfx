@@ -1,0 +1,158 @@
+
+uniform_bool uDisable {
+    default = false;
+    description = "...";
+    display_name = "uDisable";
+}
+uniform_bool uDisableWithBox {
+    default = false;
+    description = "...";
+    display_name = "uDisableWithBox";
+}
+uniform_float uSharpness {
+    default = 1.0;
+    min = 0.0;
+    max = 4.0;
+    step = 0.1;
+    description = "...";
+    display_name = "uSharpness";
+}
+uniform_float uThreshold {
+    default = 0.0;
+    min = 0.0;
+    max = 0.5;
+    step = 0.01;
+    description = "...";
+    display_name = "uThreshold";
+}
+
+render_target RT_NoMipmap {
+    internal_format = rgba16f;
+    source_type = half_float;
+    source_format = rgba;
+    mipmaps = false;
+    min_filter = nearest;
+    mag_filter = nearest;
+}
+fragment pre(target=RT_NoMipmap) {
+vec4 getResiduals(sampler2D tex, vec4 which_channel, vec2 uv, vec2 tex_size_pixels) {
+    vec2 inv_res = 1.0 / tex_size_pixels;
+    int half_k = 1;
+
+    const float conv_w[99] = float[99](
+        -0.01827, 0.86177, 0.16259, 0.32058, -1.06943, 0.01762, 0.09450, 0.27969, 0.11832, -0.06232, 0.37237, -0.07284, -0.86362, 0.59825, 0.09381, 0.05044,
+        -0.08803, -0.01762, -0.06007, 0.23067, 0.20162, 0.18313, -0.07967, 0.34993, 0.06566, 0.76541, -0.27835, -0.06692, 0.14906, 0.08802, -0.67102, 1.49385,
+        -0.26856, 0.04828, -0.16746, 0.04821, -0.01808, -0.22190, -0.03942, -0.56994, 1.39111, -0.23040, -0.01578, -0.15029, -0.10854, -0.17278, 0.01867, 0.12866,
+        -0.21422, -0.26235, 0.58953, 0.18775, 0.95708, 0.15380, -0.09655, 0.54988, 0.11163, 0.46551, 0.33080, -0.20159, 0.17230, 0.22772, -0.04886, 0.03706,
+        -0.07364, -0.62966, -0.78593, 0.79152, 0.00391, 0.19136, 0.35120, 0.16097, 0.01608, -0.01444, -0.00619, -0.02801, -1.29981, 0.53489, 0.07483, 0.79806,
+        -0.08414, -0.05319, -0.14637, -0.02219, 0.01969, 1.01793, -0.76468, 0.00982, -0.09782, 0.04446, 0.12698, -0.04322, -0.19194, 0.12153, 0.19302, 0.17789,
+        0.22258, 0.14816, -0.48564
+    );
+    const float conv_b[11] = float[11](
+        0.23953, -0.00734, 0.01677, 0.38603, -0.02291, 0.08702, 0.07206, -0.05088, 0.00574, -0.00182, 0.05960
+    );
+    const float mid_0_w[121] = float[121](
+        -0.04915, -0.84158, 0.21622, -0.69158, -0.99921, 0.29477, -0.09268, -0.00496, -0.87654, 0.45124, -0.25871, -0.79840, -0.11163, 0.18879, 0.27310, 0.16309,
+        0.02382, 0.17657, 0.28272, -1.10956, -0.13963, -0.46649, -0.45179, 0.76454, 0.30001, 0.09884, -1.85347, -0.41990, 0.32753, -0.12456, 0.61223, 0.44629,
+        -0.05537, 1.09968, -0.03916, 0.02531, -0.68513, 0.28438, 0.30016, -0.58594, -0.17112, -0.13494, -0.64379, 0.12453, -0.65090, -0.60434, 0.05028, 0.33885,
+        -0.09056, 0.24096, -0.08306, 0.42284, -1.58760, 0.65577, 0.02726, -1.01520, 0.19232, 0.00873, 0.52152, 0.05162, -0.38492, 0.66330, -0.06359, 0.60109,
+        0.06374, -0.15152, -0.71687, -1.12568, 0.09614, 0.73782, 0.41734, -0.11683, 0.06912, 0.57386, 0.13283, 0.48380, -0.04298, -0.55401, 0.48681, 0.43207,
+        -0.13072, -1.97961, -0.11658, 0.08440, 0.06330, 0.14926, 0.84669, -0.06345, 0.97937, -1.98861, -0.47095, -0.22975, 0.85724, 0.62650, -0.54925, -0.09407,
+        0.12089, -1.98846, 0.03289, -0.52313, 0.33339, 0.06132, 0.45862, -0.94141, 0.33675, -0.29437, -0.60675, -0.10560, -1.29210, 0.16497, -0.09591, 0.69634,
+        -0.21889, -0.27358, -0.31663, -0.08922, 0.44860, -0.02115, 0.43506, -1.69560, 0.00393
+    );
+    const float mid_0_b[11] = float[11](
+        -0.07420, 0.09429, 0.04778, 0.01027, -0.00057, 0.03293, -0.10860, 0.14681, -0.15591, -0.12349, 0.10522
+    );
+    const float zfinal_w[44] = float[44](
+        -0.15164, 0.13872, 0.45372, -0.33901, 0.59104, 0.35505, -0.57784, -0.23257, 0.23464, -0.59375, -0.13646, -0.22233, -0.14943, 0.39397, -0.49916, 0.35185,
+        0.09969, -0.04720, -0.95726, 0.13616, 0.70835, 0.61534, 0.32445, 0.36694, 0.00710, 0.21700, -0.61405, 0.00212, 0.33181, 0.55491, -0.18706, -0.71679,
+        -0.90588, -0.60498, -0.18092, -1.06577, -0.11063, -0.19415, 0.20650, 0.20327, 0.54757, -0.20085, 0.64887, 0.20766
+    );
+    const float zfinal_b[4] = float[4](
+        -0.00003, -0.00001, 0.00004, -0.00006
+    );
+
+    float neigh[9];
+    int idx = 0;
+    for (int dy = -half_k; dy <= half_k; dy++) {
+        for (int dx = -half_k; dx <= half_k; dx++) {
+            vec2 offset = vec2(float(dx), float(dy)) * inv_res;
+            neigh[idx++] = dot(texture(tex, uv + offset), which_channel);
+        }
+    }
+
+    float h0[11];
+    int w_idx = 0;
+    for (int i=0; i<11; i++) {
+        h0[i] = conv_b[i];
+        for (int j=0; j<9; j++) {
+            h0[i] += neigh[j] * conv_w[w_idx++];
+        }
+        h0[i] = max(0.0, h0[i]);
+    }
+
+    float h1[11];
+    w_idx = 0;
+    for (int i=0; i<11; i++) {
+        h1[i] = mid_0_b[i];
+        for (int j=0; j<11; j++) {
+            h1[i] += h0[j] * mid_0_w[w_idx++];
+        }
+        h1[i] = max(0.0, h1[i]);
+    }
+
+    vec4 out_val = vec4(zfinal_b[0], zfinal_b[1], zfinal_b[2], zfinal_b[3]);
+    w_idx = 0;
+    for (int i=0; i<4; i++) {
+        for (int j=0; j<11; j++) {
+            out_val[i] += h1[j] * zfinal_w[w_idx++];
+        }
+    }
+
+    return out_val;
+}
+
+    omw_In vec2 omw_TexCoord;
+    void main()
+    {
+        if (uDisable || uDisableWithBox) return;
+        omw_FragColor = getResiduals(omw_SamplerLastShader, vec4(0.333, 0.333, 0.333, 0.0), omw_TexCoord, omw.resolution);
+    }
+}
+fragment final(rt1=RT_NoMipmap) {
+    omw_In vec2 omw_TexCoord;
+    void main()
+    {
+        vec2 uv = (omw_TexCoord-vec2(0.5))*0.5+vec2(0.5);
+        vec4 offsets = texture2D(RT_NoMipmap, uv);
+        vec2 px = omw_TexCoord * omw.resolution;
+        ivec2 pxi = ivec2(px);
+        vec3 add = vec3(0.0);
+        if ((pxi.x & 1) == 0 && (pxi.y & 1) == 0)  add = vec3(offsets.r);
+        if ((pxi.x & 1) == 1 && (pxi.y & 1) == 0)  add = vec3(offsets.g);
+        if ((pxi.x & 1) == 0 && (pxi.y & 1) == 1)  add = vec3(offsets.b);
+        if ((pxi.x & 1) == 1 && (pxi.y & 1) == 1)  add = vec3(offsets.a);
+        omw_FragColor = texture2D(omw_SamplerLastShader, uv);
+        
+        float sharpness = uSharpness;
+        float d = dot(
+            texture2D(omw_SamplerLastShader, (round(uv * omw.resolution) - 0.5) * omw.rcpResolution)
+            - omw_FragColor,
+            vec4(0.33, 0.33, 0.33, 0.0));
+        
+        if (abs(d) < uThreshold) sharpness *= abs(d) * (1.0/uThreshold);
+        
+        if (!uDisable)
+            omw_FragColor.rgb += add * sharpness;
+        if (uDisableWithBox)
+            omw_FragColor = texture2D(omw_SamplerLastShader, (floor(uv*omw.resolution)+0.5)*omw.rcpResolution);
+    }
+}
+
+technique {
+    passes = pre, final;
+    description = "....";
+    author = "Wareya";
+    version = "1.0";
+}
