@@ -80,9 +80,90 @@ def _to_float(img: Image.Image) -> tuple[torch.Tensor, str]:
 
 def _to_pil(t: torch.Tensor, mode: str) -> Image.Image:
     """(C, H, W) float32  →  PIL image in the original mode."""
-    arr = (t.permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    arr = (t.permute(1, 2, 0).cpu().numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
     if arr.shape[2] == 1:
         return Image.fromarray(arr[:, :, 0], "L")
+    return Image.fromarray(arr, mode)
+
+
+# ── gridline removal ──────────────────────────────────────────────────────────
+# Direct NumPy translation of gridline_remover.omwfx (author: Wareya).
+#
+# Each pass detects pixels that sit on an isolated spike along one axis by
+# comparing two measures:
+#   A  – second-difference (spike indicator)  |a*0.5 - b + q - c + d*0.5|
+#   B  – first-difference  (slope indicator)  |a*-0.5 + q + d*-0.5|
+# When A > B the pixel looks more like a thin line than a smooth gradient, so
+# it is blended toward (q*0.5 + b*0.25 + c*0.25).  The blend weight is
+# normalised by the local contrast range so the effect is scale-invariant.
+# Pass X runs horizontally; pass Y runs vertically (with a 2× stronger blend).
+
+def _gridline_pass(arr: np.ndarray, axis: int, y_pass: bool) -> np.ndarray:
+    """
+    One directional pass of gridline removal.
+
+    arr   : float32 (H, W, C) in [0, 1]
+    axis  : 1 = horizontal (X pass),  0 = vertical (Y pass)
+    y_pass: if True use the 2× blend multiplier from the Y pass
+    """
+    # Replicate-pad 2 pixels on each side along the chosen axis so that
+    # edge pixels don't wrap or go out of bounds.
+    pw = [(0, 0)] * arr.ndim
+    pw[axis] = (2, 2)
+    p = np.pad(arr, pw, mode="edge")   # shape along axis is N+4
+
+    # Slice out each of the five tap positions.
+    # Along the padded axis the original data sits at indices [2 : N+2].
+    #   q -> center (original pixel)
+    #   a -> +2 ahead,  b -> +1 ahead
+    #   c -> -1 behind, d -> -2 behind
+    sl = [slice(None)] * arr.ndim
+    def _tap(offset):
+        s = list(sl)
+        n = arr.shape[axis]
+        lo = 2 + offset
+        hi = lo + n         # hi = 2 + offset + n  →  may use None for the end
+        s[axis] = slice(lo, hi if hi < p.shape[axis] else None)
+        return p[tuple(s)]
+
+    q = _tap( 0)
+    a = _tap(+2)
+    b = _tap(+1)
+    c = _tap(-1)
+    d = _tap(-2)
+
+    A = np.abs(a * 0.5  - b + q - c + d * 0.5)   # second difference
+    B = np.abs(a * -0.5 + q      + d * -0.5)      # first  difference
+
+    lo = np.minimum(q, np.minimum(a, np.minimum(b, np.minimum(c, d))))
+    hi = np.maximum(q, np.maximum(a, np.maximum(b, np.maximum(c, d))))
+    mag = hi - lo + 0.01                           # local contrast range
+
+    blend = q * 0.5 + b * 0.25 + c * 0.25         # neighbour-averaged value
+
+    scale = 2.0 if y_pass else 1.0
+    t = np.clip((A - B) / mag * scale, 0.0, 1.0)  # per-channel blend weight
+
+    return q * (1.0 - t) + blend * t
+
+
+def remove_gridlines(img: Image.Image) -> Image.Image:
+    """
+    Apply the two-pass (X then Y) gridline-removal filter to a PIL image.
+    Operates in float32 to avoid rounding accumulation; preserves the
+    original PIL mode (L / RGB / RGBA / etc.).
+    """
+    mode = img.mode
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    if arr.ndim == 2:                   # grayscale: add channel dim
+        arr = arr[:, :, np.newaxis]
+
+    arr = _gridline_pass(arr, axis=1, y_pass=False)   # horizontal
+    arr = _gridline_pass(arr, axis=0, y_pass=True)    # vertical
+
+    arr = (arr * 255.0).round().clip(0, 255).astype(np.uint8)
+    if arr.shape[2] == 1:
+        return Image.fromarray(arr[:, :, 0], mode)
     return Image.fromarray(arr, mode)
 
 
@@ -317,6 +398,9 @@ def process(args: argparse.Namespace):
                                    ycgco=args.ycgco,
                                    yonly=args.yonly)
 
+            if args.gridline_removal:
+                result = remove_gridlines(result)
+
             # Decide output path
             if single_out:
                 # honour the exact filename the user asked for
@@ -363,7 +447,16 @@ def main():
                         "and use corner-aligned bilinear interpolation for the chroma "
                         "channels.  Faster than --ycgco and avoids any chroma ringing "
                         "introduced by the network.  Implies --ycgco automatically.")
+    p.add_argument("--gridline-removal", action="store_true",
+                   help="Run a two-pass (horizontal then vertical) gridline-removal "
+                        "filter on the upscaled image before saving.  Each pass detects "
+                        "isolated single-pixel spikes along its axis and blends them "
+                        "toward their nearest neighbours.  Useful for suppressing "
+                        "upscaling artefacts that form regular grid patterns.")
+    p.add_argument("--leaky-slope",      type=float,   default=0.003)
     args = p.parse_args()
+    import model
+    model.LEAKY_SLOPE = args.leaky_slope
     process(args)
 
 

@@ -64,6 +64,8 @@ Modify `model.py` directly to set the network architecture before training. Ther
 
 **NOTE:** Some network geometries are extremely prone to breaking (getting trapped in bad local minima) on unlucky initializations, such that they fail to stop producing some artifacts during training. Either babysit them for the first 100 epochs, checking their output to make sure they aren't going to break, or wrap training in a harness that trains multiple copies of them (at least 4) and picks the best one based on PSNR tests (if you need that harness, build it yourself). Training is done with Leaky ReLUs instead of pure ReLUs to make this problem less common, but it can still happen for extremely small network configurations.
 
+If gridlines or checkerboards appear on certain colors of flat surface after training, don't throw the model away. Instead, `--resume` a copy of it with a very low learning rate like `--lr 0.001` for a few epochs. If the artifacts still appear, try again. If they still appear, try a higher or lower learning rate.
+
 ## Results
 
 TODO: automatically take PSNR readings and compare to "waifu2x" (cunet) and "Convolutional upscaling Neural Network, yeah!"

@@ -219,11 +219,8 @@ class UpscaleDataset(Dataset):
             hr_out, hr_for_lr = random.choice(blur_variants)
             rot    = random.randint(0, 3)
             flip   = random.random() > 0.5
-            #offset = (random.uniform(-brightness_range, brightness_range)
-            #          if random.random() > 0.5 else 0.0)
-            
-            brightness = (random.uniform(0.5, 1.0)
-                      if random.random() > 0.5 else 1.0)
+            offset = (random.uniform(-brightness_range, brightness_range)
+                      if random.random() > 0.5 else 0.0)
 
             lr, baseline = precomputed[id(hr_for_lr)]
 
@@ -231,14 +228,10 @@ class UpscaleDataset(Dataset):
             a_lr      = _orient(lr,      rot, flip)
             a_baseline= _orient(baseline,rot, flip)
 
-            #if offset != 0.0:
-            #    a_out      = (a_out      + offset).clamp(0.0, 1.0)
-            #    a_lr       = (a_lr       + offset).clamp(0.0, 1.0)
-            #    a_baseline = (a_baseline + offset).clamp(0.0, 1.0)
-            if brightness != 1.0:
-                a_out      = a_out      * brightness
-                a_lr       = a_lr       * brightness
-                a_baseline = a_baseline * brightness
+            if offset != 0.0:
+                a_out      = (a_out      + offset).clamp(0.0, 1.0)
+                a_lr       = (a_lr       + offset).clamp(0.0, 1.0)
+                a_baseline = (a_baseline + offset).clamp(0.0, 1.0)
 
             residual = a_out - a_baseline
             self.pairs.append((a_lr, residual))
@@ -308,48 +301,12 @@ def trysave(model, out_path):
             save_file(model.state_dict(), str(out_path))
         except:
             import time
-            time.sleep(0.005)
+            time.sleep(0.0005)
             try:
                 save_file(model.state_dict(), str(out_path))
             except:
                 print("failed to save!")
                 pass
-
-
-def run_validation(model, val_dataset, device) -> float:
-    loss_l1  = nn.L1Loss()
-    loss_mse = nn.MSELoss()
-
-    ph = val_dataset.patch_size
-
-    model.eval()
-    total = torch.tensor(0.0, device=device)  # accumulate on GPU, no per-step sync
-    n = 0
-    with torch.no_grad():
-        for lr, residual in val_dataset.pairs:
-            C, lH, lW = lr.shape
-
-            if lH > ph and lW > ph:
-                ly = (lH - ph) // 2
-                lx = (lW - ph) // 2
-                lr_patch  = lr[:,       ly     : ly + ph,       lx     : lx + ph     ]
-                res_patch = residual[:, ly * 2 :(ly + ph) * 2,  lx * 2:(lx + ph) * 2]
-            else:
-                lr_patch  = lr
-                res_patch = residual
-
-            # Stack all channels into a single batch — one forward pass per pair
-            lr_in  = lr_patch.unsqueeze(1).to(device)   # (C, 1, ph, pw)
-            res_in = res_patch.unsqueeze(1).to(device)  # (C, 1, 2ph, 2pw)
-
-            pred = model(lr_in)
-
-            #pixel_loss    = loss_mse(pred, res_in)
-            pixel_loss    = loss_l1(pred, res_in) + loss_mse(pred, res_in)
-            total += pixel_loss   # stays on GPU
-            n += 1
-
-    return (total / n).item() if n > 0 else float("inf")  # single GPU→CPU sync
 
 # ── training loop ─────────────────────────────────────────────────────────────
 
@@ -460,24 +417,6 @@ def train(args: argparse.Namespace):
         persistent_workers=(args.num_workers > 0),
         drop_last=True,
     )
-
-    # Validation dataset — created once, reused every epoch.
-    # precompute_factor=1 means all pairs are used each time, which naturally
-    # produces ~the same number of patches as one training epoch (the training
-    # epoch also sees n_images × n_aug pairs, just drawn from a larger pool).
-    # Fresh random augmentation samples are generated independently of the
-    # training dataset's samples.
-    val_data_folder = args.val_data if args.val_data else args.data
-    val_dataset = UpscaleDataset(
-        val_data_folder,
-        patch_size=args.patch_size,
-        patches_per_pair=args.patches_per_pair,
-        n_aug=args.n_aug,
-        brightness_range=args.brightness_range,
-        precompute_factor=1,
-    )
-    print(f"Validation set: {len(val_dataset.pairs)} pairs")
-
     # Optimiser + schedule
     #optimizer = torch.optim.AdamW(
     optimizer = torch.optim.Adam(
@@ -533,7 +472,7 @@ def train(args: argparse.Namespace):
                 # (the conditional mean under L1/MSE is ≈ 0 for diverse patches).
                 absolute_loss = loss_l1(pred, res_patch)
                 proportional_loss = loss_mse(pred, res_patch)
-                pixel_loss = absolute_loss + proportional_loss
+                pixel_loss = absolute_loss * 0.5 + proportional_loss * 0.5
                 
                 gradient_loss = loss_gradient(pred, res_patch)
                 
@@ -550,7 +489,6 @@ def train(args: argparse.Namespace):
                 #  accidentally learning to hallucinate ultra high-frequency detail when not appropriate.
                 #loss = lE_loss * 0.9 + pixel_loss * 0.1
                 loss = lE_loss
-                #loss = pixel_loss
                 
                 if args.basic_loss:
                     loss = pixel_loss
@@ -573,16 +511,15 @@ def train(args: argparse.Namespace):
 
         avg_loss = running_loss / len(loader)
         lr_now   = scheduler.get_last_lr()[0]
-
-        if args.strict_validation:
-            val_loss = run_validation(model, val_dataset, device)
-            print(f"Epoch {epoch:4d} | train {avg_loss:.6f} | val {val_loss:.6f} | lr {lr_now:.2e}")
-            if val_loss < best_loss:
-                best_loss = val_loss
-                trysave(model, out_path)
-                print(f"  ✓ saved  {out_path}  (best val loss {best_loss:.6f})")
-        else:
-            print(f"Epoch {epoch:4d} | loss {avg_loss:.6f} | lr {lr_now:.2e}")
+        print(f"Epoch {epoch:4d} | loss {avg_loss:.6f} | lr {lr_now:.2e}")
+        
+        if avg_loss < best_loss and args.strict_validation:
+            # FIXME: run validation loss on its own validation set instead of using the training loss
+            # NOTE: need to generate NEW augmentation samples for the validation set, NOT reuse training ones
+            best_loss = avg_loss
+            trysave(model, out_path)
+            print(f"  ✓ saved  {out_path}  (best loss {best_loss:.6f})")
+        elif not args.strict_validation:
             trysave(model, out_path)
 
     print("Training complete.")
@@ -625,8 +562,6 @@ def main():
     p.add_argument("--bconv-nograd",      action="store_true")
     p.add_argument("--basic-loss",        action="store_true")
     p.add_argument("--strict-validation", action="store_true")
-    p.add_argument("--val-data", default=None,
-                   help="Folder of validation images (default: same as data folder)")
     args = p.parse_args()
     import model
     model.LEAKY_SLOPE = args.leaky_slope
