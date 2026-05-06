@@ -67,6 +67,7 @@ def loss_gradient(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     loss_y = d[:, :, 1:, :] - d[:, :, :-1, :]
     return loss_x.abs().mean() + loss_y.abs().mean()
 
+_z_buffer = None
 
 def loss_lE(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
@@ -79,6 +80,7 @@ def loss_lE(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     Returns:
         Scalar loss tensor.
     """
+    global _z_buffer
     # Residual between prediction and target
     residual = pred - target  # shape (B, C, H, W)
     
@@ -168,10 +170,12 @@ class UpscaleDataset(Dataset):
         n_aug: int = 8,
         brightness_range: float = 0.15,
         precompute_factor: int = 1,
+        pad: int = 0,
     ):
-        self.patch_size      = patch_size
+        self.patch_size       = patch_size
         self.patches_per_pair = patches_per_pair
         self.precompute_factor = precompute_factor
+        self.pad              = pad
 
         # Precomputed storage: list of (lr, residual), both (C, H/2, W/2) / (C, H, W)
         self.pairs: list[tuple[torch.Tensor, torch.Tensor]] =[]
@@ -251,18 +255,27 @@ class UpscaleDataset(Dataset):
         lr, residual = self.pairs[idx % len(self.pairs)]
 
         C, lH, lW = lr.shape
-        ph = self.patch_size
+        ph  = self.patch_size
+        pad = self.pad
 
-        # Random spatial patch (the only work done at training time)
-        if lH > ph and lW > ph:
+        # Random spatial patch (the only work done at training time).
+        # When pad > 0, the LR patch is (ph + 2*pad) on each side so the network
+        # sees only real context pixels and needs no padding at all.  The residual
+        # target stays ph-sized; the training loop crops the prediction to match.
+        if lH > ph + 2 * pad and lW > ph + 2 * pad:
+            ly = random.randint(pad, lH - ph - pad - 1)
+            lx = random.randint(pad, lW - ph - pad - 1)
+            lr       = lr      [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
+            residual = residual[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
+        elif lH > ph and lW > ph:
             ly = random.randint(0, lH - ph - 1)
             lx = random.randint(0, lW - ph - 1)
-            lr       = lr[:,       ly     : ly + ph,       lx     : lx + ph     ]
-            residual = residual[:, ly * 2 :(ly + ph) * 2,  lx * 2:(lx + ph) * 2]
+            lr       = lr      [:, ly : ly + ph,        lx : lx + ph      ]
+            residual = residual[:, ly * 2 : (ly+ph)*2,  lx * 2 : (lx+ph)*2]
 
         # Random single channel
         c = random.randrange(C)
-        return lr[c : c + 1], residual[c : c + 1]   # (1, ph, pw), (1, 2ph, 2pw)
+        return lr[c : c + 1], residual[c : c + 1]   # (1, ph+2*pad, pw+2*pad), (1, 2ph, 2pw)
 
 
 class ChunkedRandomSampler(Sampler):
@@ -320,7 +333,8 @@ def run_validation(model, val_dataset, device) -> float:
     loss_l1  = nn.L1Loss()
     loss_mse = nn.MSELoss()
 
-    ph = val_dataset.patch_size
+    ph  = val_dataset.patch_size
+    pad = val_dataset.pad
 
     model.eval()
     total = torch.tensor(0.0, device=device)  # accumulate on GPU, no per-step sync
@@ -329,20 +343,27 @@ def run_validation(model, val_dataset, device) -> float:
         for lr, residual in val_dataset.pairs:
             C, lH, lW = lr.shape
 
-            if lH > ph and lW > ph:
+            if lH > ph + 2 * pad and lW > ph + 2 * pad:
                 ly = (lH - ph) // 2
                 lx = (lW - ph) // 2
-                lr_patch  = lr[:,       ly     : ly + ph,       lx     : lx + ph     ]
-                res_patch = residual[:, ly * 2 :(ly + ph) * 2,  lx * 2:(lx + ph) * 2]
+                lr_patch  = lr      [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
+                res_patch = residual[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
+            elif lH > ph and lW > ph:
+                ly = (lH - ph) // 2
+                lx = (lW - ph) // 2
+                lr_patch  = lr      [:, ly : ly + ph,       lx : lx + ph      ]
+                res_patch = residual[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
             else:
                 lr_patch  = lr
                 res_patch = residual
 
             # Stack all channels into a single batch — one forward pass per pair
-            lr_in  = lr_patch.unsqueeze(1).to(device)   # (C, 1, ph, pw)
+            lr_in  = lr_patch.unsqueeze(1).to(device)   # (C, 1, ph+2*pad, pw+2*pad)
             res_in = res_patch.unsqueeze(1).to(device)  # (C, 1, 2ph, 2pw)
 
             pred = model(lr_in)
+            if pad > 0:
+                pred = pred[:, :, pad * 2 : -pad * 2, pad * 2 : -pad * 2]
 
             #pixel_loss    = loss_mse(pred, res_in)
             pixel_loss    = loss_l1(pred, res_in) + loss_mse(pred, res_in)
@@ -403,22 +424,16 @@ def train(args: argparse.Namespace):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {total_params:,}")
     
-    with torch.no_grad():
-        if args.bconv_nograd and hasattr(model, "bconv"):
-            for param in model.bconv.parameters():
-                param.requires_grad = False
-            torch.nn.init.zeros_(model.bconv.weight)
-            torch.nn.init.zeros_(model.bconv.bias)
-            model.bconv.weight[0, 0, 0, 1] = -0.9
-            model.bconv.weight[1, 0, 1, 0] = -0.9
-            model.bconv.weight[2, 0, 2, 1] = -0.9
-            model.bconv.weight[3, 0, 1, 2] = -0.9
-            model.bconv.weight[0, 0, 1, 1] = 0.9
-            model.bconv.weight[1, 0, 1, 1] = 0.9
-            model.bconv.weight[2, 0, 1, 1] = 0.9
-            model.bconv.weight[3, 0, 1, 1] = 0.9
-    
     model = model.to(device)
+
+    # Total LR-space receptive field padding — used to pre-pad training patches
+    # so the network never has to pad during the forward pass.
+    pad = sum((conv.kernel_size[0] - 1) // 2
+              for conv in [*model.layers, model.zfinal]
+              if conv.kernel_size[0] > 1)
+    print(f"Receptive field pad: {pad} LR px")
+    if pad > 0:
+        model.set_padding_enabled(False)
     
     try:
         save_file(model.state_dict(), str(out_path))
@@ -434,6 +449,7 @@ def train(args: argparse.Namespace):
         n_aug=args.n_aug,
         brightness_range=args.brightness_range,
         precompute_factor=args.precompute_factor,
+        pad=pad,
     )
 
     sampler = ChunkedRandomSampler(
@@ -475,16 +491,17 @@ def train(args: argparse.Namespace):
         n_aug=args.n_aug,
         brightness_range=args.brightness_range,
         precompute_factor=1,
+        pad=pad,
     )
     print(f"Validation set: {len(val_dataset.pairs)} pairs")
 
     # Optimiser + schedule
-    #optimizer = torch.optim.AdamW(
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
-        #betas=(0.9, 0.999),
+        betas=(0.9, 0.999),
         lr=args.lr,
-        foreach=False,
+        #foreach=False,
+        foreach=True,
     )
     
     #optimizer = torch.optim.SGD(
@@ -526,7 +543,9 @@ def train(args: argparse.Namespace):
             #with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             # Not supported by old versions of torch-directml. dummy it out and don't use amp.
             if True:
-                pred = model(lr_patch)              # (B, 1, 2ph, 2pw)
+                pred = model(lr_patch)              # (B, 1, 2*(ph+2*pad), 2*(pw+2*pad))
+                if pad > 0:
+                    pred = pred[:, :, pad * 2 : -pad * 2, pad * 2 : -pad * 2]
                 # Pixel loss: L1 for sharp gradients, MSE to penalise large outliers.
                 # Gradient loss: L1 on spatial first-differences. This is the critical
                 # term — it prevents the network collapsing to a near-zero residual
@@ -535,22 +554,9 @@ def train(args: argparse.Namespace):
                 proportional_loss = loss_mse(pred, res_patch)
                 pixel_loss = absolute_loss + proportional_loss
                 
-                gradient_loss = loss_gradient(pred, res_patch)
-                
-                proven_loss = gradient_loss * 0.4 + pixel_loss * 0.6
-                
-                lE_loss = loss_lE(pred, res_patch)
-                
-                #interp = float(epoch) / args.epochs
-                #loss = proven_loss * (1.0 - interp) + lE_loss * interp
-                #loss = proven_loss
-                #loss = lE_loss
-                
-                # Incorporating a small amount of pixel loss helps reduce the risk of the model
-                #  accidentally learning to hallucinate ultra high-frequency detail when not appropriate.
-                #loss = lE_loss * 0.9 + pixel_loss * 0.1
-                loss = lE_loss
-                #loss = pixel_loss
+                if not args.basic_loss:
+                    lE_loss = loss_lE(pred, res_patch)
+                    loss = lE_loss
                 
                 if args.basic_loss:
                     loss = pixel_loss
@@ -561,17 +567,20 @@ def train(args: argparse.Namespace):
             scaler.step(optimizer)
             scaler.update()
             
+            #with torch.no_grad():
+            #    for param in model.parameters():
+            #        param.clamp_(-3.99, 3.99)
             with torch.no_grad():
-                for param in model.parameters():
-                    param.clamp_(-3.99, 3.99)
+                torch._foreach_clamp_min_(list(model.parameters()), -3.99)
+                torch._foreach_clamp_max_(list(model.parameters()),  3.99)
             
-            running_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.5f}")
+            lossitem = loss
+            running_loss += lossitem
+            pbar.set_postfix(loss=f"{lossitem:.5f}")
 
         scheduler.step()
-        
 
-        avg_loss = running_loss / len(loader)
+        avg_loss = running_loss.item() / len(loader)
         lr_now   = scheduler.get_last_lr()[0]
 
         if args.strict_validation:
@@ -604,7 +613,7 @@ def main():
                    help="Output .safetensors path  (default: upscaler.safetensors)")
     p.add_argument("--resume", default=None,
                    help="Load existing .safetensors weights and continue training")
-    p.add_argument("--epochs",           type=int,   default=100)
+    p.add_argument("--epochs",           type=int,   default=700)
     p.add_argument("--batch-size",       type=int,   default=64)
     
     p.add_argument("--patch-size",        type=int,   default=64,
@@ -622,7 +631,6 @@ def main():
     p.add_argument("--lr",                type=float, default=2e-3)
     p.add_argument("--num-workers",       type=int,   default=4)
     p.add_argument("--leaky-slope",       type=float,   default=0.003)
-    p.add_argument("--bconv-nograd",      action="store_true")
     p.add_argument("--basic-loss",        action="store_true")
     p.add_argument("--strict-validation", action="store_true")
     p.add_argument("--val-data", default=None,

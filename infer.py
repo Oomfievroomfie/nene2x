@@ -274,8 +274,8 @@ def upscale_image(model: UpscaleNet,
         result = torch.stack(channels, dim=0)                   # (C, 2H, 2W)
     else:
         # ── tiled path (memory-safe for large images) ─────────────────────────
-        #pad    = ((KERNEL_SIZE-1)//2)           # LR pixels of overlap on each edge
-        pad    = (model.conv.size()[3] - 1) // 2
+        pad    = sum((conv.kernel_size[0] - 1) // 2
+                     for conv in [*model.layers, model.zfinal] if conv.kernel_size[0] > 1)
         stride = tile_size   # LR pixels per tile (without overlap)
         out_H, out_W = H * 2, W * 2
 
