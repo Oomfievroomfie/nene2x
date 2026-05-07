@@ -55,15 +55,47 @@ import torch.nn.functional as F
 
 # ... reorganized training data
 
-#gConfig = "3x3_32,3x3_64,1x1_64,3x3_128,1x1_96,3x3_64,3x3_48,1x1_4"
-gConfig = "3x3_32,3x3_64,1x1_96,3x3_96,1x1_32,3x3_32,1x1_4" # ...
+#gConfig = "3x3_32,3x3_64,1x1_64,3x3_128,1x1_96,3x3_64,3x3_48,1x1_4" # beat waifu2x at some point on marona. 192k params
+#gConfig = "3x3_24,3x3_48,1x1_64,3x3_72,1x1_32,3x3_24,1x1_4" # 64k params. 39.9 psnr
+#gConfig = "3x3_24,3x3_32,1x1_24,3x3_64,1x1_24,3x3_16,1x1_4" # 27k params. 39.7 psnr
+#gConfig = "3x3_24,3x3_32,1x1_24,3x3_16,1x1_4" # 11k params. 38.6 psnr. scrapping
+#gConfig = "3x3_24,3x3_32,1x1_24,3x3_24,1x1_16,1x1_4" # 13.6k params. 39.45 psnr
+#gConfig = "3x3_12,3x3_16,3x3_24,1x1_16,1x1_4" # 5.8k params. 38 psnr plateau at 150?
+#gConfig = "3x3_16,3x3_16,1x1_16,3x3_24,1x1_16,1x1_4" # 6.7k params. same.
+#gConfig = "3x3_16,3x3_24,1x1_16,3x3_24,1x1_16,1x1_4" # 8k params. 38.3?
+#gConfig = "3x3_24,3x3_24,1x1_16,3x3_24,1x1_16,1x1_4" # 9.7k params. stuck at 38 too lol
+#gConfig = "3x3_16,3x3_24,1x1_24,3x3_24,1x1_16,1x1_4" # 9.9k params. 39 psnr.
+#gConfig = "3x3_12,3x3_24,3x3_24,1x1_12,1x1_4" # 8.2k params. 38.7 psnr.
+#gConfig = "3x3_16,3x3_24,3x3_24,1x1_4" # 8.9k. oh. oops.
+#gConfig = "3x3_12,1x1_12,3x3_16,3x3_24,1x1_4" # 5.6k params. 38.3+
+#gConfig = "3x3_16,1x1_12,3x3_16,1x1_12,3x3_24,1x1_4" # 5k params. 38.3db psnr
+#gConfig = "3x3_12,1x1_12,3x3_24,1x1_4" # 3k params, 37.5ish psnr
+#gConfig = "3x3_16,1x1_10,3x3_20,1x1_16,1x1_4" # 2554 params.  37.3ish psnr
+#gConfig = "3x3_12,3x3_12,3x3_8,3x3_4" # 2592 params. architecturally equivalent to cdnnx "fast". 37.67ish psnr.
+#gConfig = "3x3_12,1x1_4,3x3_12,1x1_4,3x3_8,1x1_4" # 1000 params. 36.75db psnr.
+#gConfig = "3x3_12,1x1_8,3x3_12,3x3_4" # 1536 params. good! made a copy and everything.
+#gConfig = "3x3_12,1x1_8,3x3_8,1x1_4,3x3_4" # 992 params. garbage, unfortunately.
+#gConfig = "3x3_12,1x1_8,3x3_8,3x3_4" # 1100 params. 37db psnr
+#gConfig = "3x3_8,1x1_4,3x3_12,1x1_8,3x3_4" # 956 params. 36.8
+#gConfig = "3x3_10,3x3_6,1x1_6,3x3_4" # 908 params. gets stuck.
+#gConfig = "3x3_8,3x3_8,3x3_4" # 956 params (yes). 36.6.
+#gConfig = "3x3_10,1x1_8,3x3_8,1x1_4,3x3_4" # 956 params (yes). bad too
+#gConfig = "3x3_10,1x1_8,3x3_8,3x3_4" # 1064 params. 37+db psnr
+#gConfig = "3x3_4,3x3_8,1x1_8,3x3_8,1x1_4,1x1_4" # 1048 params. garbage.
+#gConfig = "3x3_4,3x3_8,1x1_8,3x3_8,1x1_4" # 1028 params. 36.7, bad.
+#gConfig = "3x3_4,3x3_12,1x1_4" # 536 params. 36.3db psnr.
+#gConfig = "3x3_8,1x1_6,3x3_4" # 354 params. 36.1db psnr.
+#gConfig = "3x3_8,1x1_4,3x3_12,1x1_4" # 612 params. 36.6+.
+#gConfig = "3x3_6,3x3_4" # 280 params. 35.5
+#gConfig = "3x3_4,1x1_4,3x3_4,1x1_4" # 228 params. 34.4, garbage.
+#gConfig = "3x3_8,1x1_4,3x3_4" # 264 params. 34.8db psnr.
+#gConfig = "3x3_8,1x1_4" # 116 params. 34.35 psnr
+gConfig = "3x3_8,1x1_4" # 
 
 
 # Intentionally extremely barely-leaky slope so that inference can treat the layer as ReLU instead of LeakyReLU.
-# If this causes checkerboard/scanline artifacts in a given model, run a fine-tuning run with train.py --resume
-#  and a low learning rate (e.g. 0.0005) and --leaky-slope 0.00001 Doing so will
-#  fine-tune with true ReLU and get rid of the artifacts.
-#LEAKY_SLOPE = 0.0002
+# If this causes checkerboard/scanline artifacts in a given model, finish off the model with:
+#  uv run python train.py train --epochs 150 --resume FILENAME.safetensors --lr 0.0005 --strict-validation --leaky-slope 0.00001 --basic-loss
 LEAKY_SLOPE = 0.00005
 
 
@@ -159,7 +191,13 @@ class UpscaleNet(nn.Module):
         Disable during training when patches are pre-padded with real data."""
         for conv in [*self.layers, self.zfinal]:
             if conv.kernel_size[0] > 1:
-                conv.padding_mode = ("circular" if self.is_wrapping else "replicate") if enabled else "zeros"
+                if enabled:
+                    pad = (conv.kernel_size[0] - 1) // 2
+                    conv.padding = (pad, pad)
+                    conv.padding_mode = "circular" if self.is_wrapping else "replicate"
+                else:
+                    conv.padding = (0, 0)
+                    conv.padding_mode = "zeros"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 1, H, W)  →  (B, 1, 2H, 2W) residual"""

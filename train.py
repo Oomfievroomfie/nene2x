@@ -362,8 +362,7 @@ def run_validation(model, val_dataset, device) -> float:
             res_in = res_patch.unsqueeze(1).to(device)  # (C, 1, 2ph, 2pw)
 
             pred = model(lr_in)
-            if pad > 0:
-                pred = pred[:, :, pad * 2 : -pad * 2, pad * 2 : -pad * 2]
+            # padding consumed by valid convs — output is already (C, 1, 2ph, 2pw)
 
             #pixel_loss    = loss_mse(pred, res_in)
             pixel_loss    = loss_l1(pred, res_in) + loss_mse(pred, res_in)
@@ -467,14 +466,16 @@ def train(args: argparse.Namespace):
         + (f"(using 1/{args.precompute_factor} of precomputed pairs per epoch)" if args.precompute_factor > 1 else "(all pairs per epoch)")
     )
 
+    from torch.utils.data.dataloader import default_collate
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
+        num_workers=0,
+        pin_memory=(device.type != "cpu"),
+        persistent_workers=False,
         drop_last=True,
+        collate_fn=lambda x: tuple(x_.to(device) for x_ in default_collate(x))
     )
 
     # Validation dataset — created once, reused every epoch.
@@ -500,8 +501,8 @@ def train(args: argparse.Namespace):
         model.parameters(),
         betas=(0.9, 0.999),
         lr=args.lr,
-        #foreach=False,
-        foreach=True,
+        foreach=False,
+        #foreach=True,
     )
     
     #optimizer = torch.optim.SGD(
@@ -543,9 +544,7 @@ def train(args: argparse.Namespace):
             #with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             # Not supported by old versions of torch-directml. dummy it out and don't use amp.
             if True:
-                pred = model(lr_patch)              # (B, 1, 2*(ph+2*pad), 2*(pw+2*pad))
-                if pad > 0:
-                    pred = pred[:, :, pad * 2 : -pad * 2, pad * 2 : -pad * 2]
+                pred = model(lr_patch)              # (B, 1, 2*ph, 2*pw)  padding consumed by valid convs
                 # Pixel loss: L1 for sharp gradients, MSE to penalise large outliers.
                 # Gradient loss: L1 on spatial first-differences. This is the critical
                 # term — it prevents the network collapsing to a near-zero residual
@@ -567,16 +566,16 @@ def train(args: argparse.Namespace):
             scaler.step(optimizer)
             scaler.update()
             
+            for param in model.parameters():
+                torch.clamp(param, min=-3.99, max=3.99)
+            
             #with torch.no_grad():
             #    for param in model.parameters():
             #        param.clamp_(-3.99, 3.99)
-            with torch.no_grad():
-                torch._foreach_clamp_min_(list(model.parameters()), -3.99)
-                torch._foreach_clamp_max_(list(model.parameters()),  3.99)
             
             lossitem = loss
             running_loss += lossitem
-            pbar.set_postfix(loss=f"{lossitem:.5f}")
+            #pbar.set_postfix(loss=f"{lossitem:.5f}")
 
         scheduler.step()
 

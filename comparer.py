@@ -3,6 +3,9 @@ from PIL import Image
 import argparse
 import sys
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.models._utils")
+
 # Skimage metrics
 from skimage.metrics import (
     peak_signal_noise_ratio as psnr_func,
@@ -10,6 +13,16 @@ from skimage.metrics import (
     normalized_mutual_information as nmi_func,
     variation_of_information as voi_func
 )
+
+def load_lpips():
+    try:
+        import torch
+        import lpips
+        return torch, lpips
+    except ImportError as e:
+        print(f"Error: LPIPS requires 'torch' and 'lpips' packages. ({e})")
+        sys.exit(1)
+
 
 def mae_func(gt, pred, data_range=1.0):
     gt = gt.astype(np.float32) / data_range
@@ -23,7 +36,7 @@ def fft2_power_of_2(image):
     return ret
 
 
-def run_comparison(gt_path, est_path):
+def run_comparison(gt_path, est_path, args):
     try:
         img_gt = Image.open(gt_path)
         img_est = Image.open(est_path)
@@ -66,6 +79,16 @@ def run_comparison(gt_path, est_path):
     bvoi_total = sum(voi_func(gt_binned, est_binned))
 
     mae_val = mae_func(gt_arr, est_arr, data_range=255)
+
+    lpips_val = None
+    if args.lpips:
+        torch, lpips_lib = load_lpips()
+        loss_fn = lpips_lib.LPIPS(net='alex')
+        # LPIPS expects tensors in [-1, 1], shape (N, C, H, W)
+        def to_lpips_tensor(arr):
+            t = torch.from_numpy(arr.astype(np.float32) / 127.5 - 1.0)
+            return t.permute(2, 0, 1).unsqueeze(0)
+        lpips_val = loss_fn(to_lpips_tensor(gt_arr), to_lpips_tensor(est_arr)).item()
     
     # Output Formatting
     print("-" * 50)
@@ -77,11 +100,15 @@ def run_comparison(gt_path, est_path):
     print(f"MAE:      {mae_val:7.4f}  (Better: Lower)")
     print(f"VOI:      {voi_total:7.4f}  (Better: Lower)")
     print(f"B-VOI:    {bvoi_total:7.4f}  (Better: Lower)")
+    if lpips_val is not None:
+        print(f"LPIPS:    {lpips_val:7.4f}  (Better: Lower)")
     print("-" * 50)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("ground_truth")
     parser.add_argument("estimate")
+    parser.add_argument("--lpips", action="store_true",
+                        help="Compute LPIPS score (requires torch and lpips packages)")
     args = parser.parse_args()
-    run_comparison(args.ground_truth, args.estimate)
+    run_comparison(args.ground_truth, args.estimate, args)
