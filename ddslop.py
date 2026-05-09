@@ -1598,25 +1598,28 @@ def _write_header_dx10(f, width, height, dxgi_format, mip_count):
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def save_dds(image, dest, pixel_format=None, mipmaps=True, mipmaps_linear=False, pca=0):
-    """Save a PIL Image as a DDS file with BCn compression and mipmaps.
+def _is_bc7(pixel_format):
+    return pixel_format in ("BC7", "BC7lite", "BC7nano", "BC7zero")
+
+
+def to_buffer(image, pixel_format=None, mipmaps=True, mipmaps_linear=False, pca=0):
+    """Compress a PIL Image to DDS and return the raw bytes.
 
     Args:
         image:        PIL Image (any mode — converted automatically).
-        dest:         File path (str / Path) or writable binary file object.
-        pixel_format: ``"DXT1"`` (BC1), ``"DXT5"`` (BC3), or ``"BC7"`` (BPTC).
+        pixel_format: ``"DXT1"`` (BC1), ``"DXT5"`` (BC3), ``"BC7"`` / ``"BC7lite"``
+                      / ``"BC7nano"`` / ``"BC7zero"`` (BPTC).
                       Auto-detected from image mode when *None*.
         mipmaps:      Generate a full mipmap chain down to 1×1 (default True).
-        pca:          Number of power-iteration steps for PCA endpoint selection.
-                      0 (default) uses fast bounding-box endpoints; 4 is a good
-                      quality/speed trade-off.
+        mipmaps_linear: Generate mipmaps in linear light (default False).
+        pca:          PCA power-iteration steps for endpoint selection (0 = bbox).
     """
     if pixel_format is None:
         pixel_format = "DXT5" if image.mode in ("RGBA", "LA", "PA") else "DXT1"
     if pixel_format not in ("DXT1", "DXT5", "BC7", "BC7lite", "BC7nano", "BC7zero"):
         raise ValueError(f"pixel_format must be 'DXT1', 'DXT5', or 'BC7', got {pixel_format!r}")
 
-    if pixel_format == "BC7" or pixel_format == "BC7lite" or pixel_format == "BC7nano" or pixel_format == "BC7zero":
+    if _is_bc7(pixel_format):
         image = image.convert("RGBA")
     else:
         image = image.convert("RGBA" if pixel_format == "DXT5" else "RGB")
@@ -1631,36 +1634,53 @@ def save_dds(image, dest, pixel_format=None, mipmaps=True, mipmaps_linear=False,
                 mw, mh = max(1, mw // 2), max(1, mh // 2)
                 levels.append(image.resize((mw, mh), Image.Resampling.BOX))
         else:
-            # linear-light mipmap generation
-            # sRGB -> Linear
             arr = np.array(image, dtype=np.float32) / 255.0
             c_idx = slice(-1) if (arr.ndim == 3 and arr.shape[-1] in (2, 4)) else slice(None)
-            arr[..., c_idx] = np.where(arr[..., c_idx] <= 0.04045, arr[..., c_idx] / 12.92, ((arr[..., c_idx] + 0.055) / 1.055) ** 2.4)
-
-            # Pillow lacks native multichannel float, so we process as a list of single-channel 'F' images
-            bands = [Image.fromarray(arr[..., i], 'F') for i in range(arr.shape[-1])] if arr.ndim == 3 else[Image.fromarray(arr, 'F')]
-
+            arr[..., c_idx] = np.where(arr[..., c_idx] <= 0.04045,
+                                       arr[..., c_idx] / 12.92,
+                                       ((arr[..., c_idx] + 0.055) / 1.055) ** 2.4)
+            bands = ([Image.fromarray(arr[..., i], 'F') for i in range(arr.shape[-1])]
+                     if arr.ndim == 3 else [Image.fromarray(arr, 'F')])
             while mw > 1 or mh > 1:
                 mw, mh = max(1, mw // 2), max(1, mh // 2)
-                
-                # Use Pillow's native float resizing
-                bands =[b.resize((mw, mh), Image.Resampling.BOX) for b in bands]
-                
-                # Linear -> sRGB for storage
-                s_mip = np.stack([np.array(b) for b in bands], axis=-1) if arr.ndim == 3 else np.array(bands[0])
-                s_mip[..., c_idx] = np.where(s_mip[..., c_idx] <= 0.0031308, s_mip[..., c_idx] * 12.92, 1.055 * (s_mip[..., c_idx] ** (1/2.4)) - 0.055)
+                bands = [b.resize((mw, mh), Image.Resampling.BOX) for b in bands]
+                s_mip = (np.stack([np.array(b) for b in bands], axis=-1)
+                         if arr.ndim == 3 else np.array(bands[0]))
+                s_mip[..., c_idx] = np.where(s_mip[..., c_idx] <= 0.0031308,
+                                             s_mip[..., c_idx] * 12.92,
+                                             1.055 * (s_mip[..., c_idx] ** (1/2.4)) - 0.055)
                 levels.append(Image.fromarray((np.clip(s_mip, 0, 1) * 255).astype(np.uint8)))
 
-    # Write
+    import io
+    buf = io.BytesIO()
+    if _is_bc7(pixel_format):
+        _write_header_dx10(buf, w, h, 98, len(levels))
+    else:
+        _write_header(buf, w, h, pixel_format, len(levels))
+    for lvl in levels:
+        buf.write(_compress_level(np.asarray(lvl), pixel_format, pca=pca))
+    return buf.getvalue()
+
+
+def save_dds(image, dest, pixel_format=None, mipmaps=True, mipmaps_linear=False, pca=0):
+    """Save a PIL Image as a DDS file with BCn compression and mipmaps.
+
+    Args:
+        image:        PIL Image (any mode — converted automatically).
+        dest:         File path (str / Path) or writable binary file object.
+        pixel_format: ``"DXT1"`` (BC1), ``"DXT5"`` (BC3), ``"BC7"`` / ``"BC7lite"``
+                      / ``"BC7nano"`` / ``"BC7zero"`` (BPTC).
+                      Auto-detected from image mode when *None*.
+        mipmaps:      Generate a full mipmap chain down to 1×1 (default True).
+        mipmaps_linear: Generate mipmaps in linear light (default False).
+        pca:          PCA power-iteration steps for endpoint selection (0 = bbox).
+    """
+    data = to_buffer(image, pixel_format=pixel_format, mipmaps=mipmaps,
+                     mipmaps_linear=mipmaps_linear, pca=pca)
     own_file = not hasattr(dest, "write")
     f = open(dest, "wb") if own_file else dest
     try:
-        if pixel_format == "BC7" or pixel_format == "BC7lite" or pixel_format == "BC7nano" or pixel_format == "BC7zero":
-            _write_header_dx10(f, w, h, 98, len(levels))
-        else:
-            _write_header(f, w, h, pixel_format, len(levels))
-        for lvl in levels:
-            f.write(_compress_level(np.asarray(lvl), pixel_format, pca=pca))
+        f.write(data)
     finally:
         if own_file:
             f.close()

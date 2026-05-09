@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+import ddslop
 
 from tinygrad import Tensor
 from tinygrad.nn.state import safe_load
@@ -312,15 +313,13 @@ def process(args: argparse.Namespace):
             if single_out:
                 dest = single_out if single_out.suffix else single_out.with_suffix(ext)
             elif inp.is_file():
-                dest = out_dir / (path.stem + "_2x" + ext)
+                dest = out_dir / (path.stem + args.suffix + ext)
             else:
                 dest = out_dir / (path.stem + ext)
 
             if ext == ".dds":
-                if len(result.getbands()) == 4:
-                    result.save(dest, pixel_format="DXT5")
-                else:
-                    result.save(dest, pixel_format="DXT1")
+                pixel_format = "DXT5" if len(result.getbands()) == 4 else "DXT1"
+                ddslop.save_dds(result, dest, pixel_format=pixel_format, mipmaps=False)
             else:
                 result.save(dest)
             print(f"  {path.name}  {img.size} → {result.size}  →  {dest.name}")
@@ -340,6 +339,8 @@ def main():
     p.add_argument("input",  help="Input image file or folder")
     p.add_argument("--output", "-o", default=None)
     p.add_argument("--extension", "-e", default=None)
+    p.add_argument("--suffix", "-s", default="_2x",
+                   help="Suffix appended to the stem when upscaling a single file (default: _2x)")
     p.add_argument("--tile-size", type=int, default=256)
     p.add_argument("--wrap", action="store_true")
     p.add_argument("--ycgco", action="store_true")
