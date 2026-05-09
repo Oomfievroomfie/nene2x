@@ -54,15 +54,15 @@ def run_comparison(gt_path, est_path, args):
     gt_gray = np.array(img_gt.convert('L')).astype(float)
     est_gray = np.array(img_est.convert('L')).astype(float)
     
-    gt_gray1 = fft2_power_of_2(gt_gray).real
-    est_gray1 = fft2_power_of_2(est_gray).real
+    gt_gray1 = fft2_power_of_2(gt_gray).real.astype(float)
+    est_gray1 = fft2_power_of_2(est_gray).real.astype(float)
     
-    img = Image.fromarray(gt_gray1.astype(int)).convert('RGB')
-    #img.save('gtest.png') # for debugging
-
     print(gt_gray1.shape)
     print(gt_gray1[5][4])
     
+    #img = Image.fromarray(gt_gray1.astype(int)).convert('RGB')
+    #img.save('gtest.png') # for debugging
+
     # Calculate standard metrics
     psnr_val = psnr_func(gt_arr, est_arr, data_range=255)
     ssim_val = ssim_func(gt_gray, est_gray, data_range=255)

@@ -4,7 +4,6 @@ Dependencies: numpy, Pillow
 """
 
 import struct
-import numexpr as ne
 import numpy as np
 from PIL import Image
 
@@ -1289,6 +1288,141 @@ def _bc7_encode_3subset(pixels, mode, pca=0, best_pid=None, lite=False):
     return out_blocks, out_error
 
 
+# ── BC7 Mode 7  (2 subsets, RGBAP 5.5.5.5.1, 2-bit idx, 64 partitions) ──────
+
+def _bc7_mode7(pixels, pca=0, best_pid=None, lite=False, nano=False):
+    """pixels: (n,16,4) float32.  Returns (blocks, error).
+
+    Bit layout:
+      [0:7]   mode indicator (bit 7 set, 8 bits)
+      [8:13]  partition ID (6 bits)
+      [14:93] R0R1R2R3 G0G1G2G3 B0B1B2B3 A0A1A2A3 (5 bits each = 80 bits)
+      [94:97] P0 P1 P2 P3 (4 bits, unique per endpoint)
+      [98:127] indices (2 anchors × 1 bit + 14 × 2 bits = 30 bits)
+    """
+    n = pixels.shape[0]
+
+    if best_pid is None:
+        best_pid = _bc7_best_partition(pixels[:, :, :3], n, lite=lite, nano=nano)
+
+    out_blocks = np.zeros((n, 16), np.uint8)
+    out_error  = np.full(n, np.float32(1e30))
+
+    cb          = 5
+    weights, bounds = _BC7_W2, _BC7_B2
+    anchor_thresh   = 2   # 1 << (2 - 1)
+    max_idx         = 3
+
+    for pid in range(64):
+        sel = best_pid == pid
+        if not sel.any():
+            continue
+        pix = pixels[sel]        # (k, 16, 4)
+        k   = pix.shape[0]
+        part    = _BC7_P2[pid]
+        m0      = part == 0
+        m1      = ~m0
+        anchor1 = int(_BC7_A2[pid])
+
+        c_list  = []   # 4 × (k, 4) uint8
+        pb_list = []   # 4 × (k,)   uint8
+        dq_list = []   # 4 × (k, 4) float32
+
+        def _quant_ep_rgba(ev):
+            ev_i   = np.clip(np.round(ev), 0, 255).astype(np.int32)
+            best_c  = np.empty((k, 4), np.uint8)
+            best_pb = np.empty(k, np.uint8)
+            best_e  = np.full(k, np.float32(1e30))
+            for pb in range(2):
+                c   = _BC7_QUANT_PB[(cb, pb)][ev_i]
+                dq  = _BC7_DEQUANT_PB[(cb, pb)][c].astype(np.float32)
+                err = ((ev - dq) ** 2).sum(axis=1)
+                bt  = err < best_e
+                best_c[bt] = c[bt]; best_pb[bt] = pb; best_e[bt] = err[bt]
+            return best_c, best_pb
+
+        for m in (m0, m1):
+            sub = pix[:, m, :]   # (k, count, 4)
+            ehi, elo = _pca_endpoints(sub, iterations=max(pca, 1), indexes=max_idx + 1)
+
+            c0, pb0 = _quant_ep_rgba(ehi)
+            c1, pb1 = _quant_ep_rgba(elo)
+            c_list.extend([c0, c1])
+            pb_list.extend([pb0, pb1])
+
+            dqt0 = np.empty((k, 4), np.float32)
+            dqt1 = np.empty((k, 4), np.float32)
+            for pb in range(2):
+                mask = pb0 == pb
+                if mask.any():
+                    dqt0[mask] = _BC7_DEQUANT_PB[(cb, pb)][c0[mask]].astype(np.float32)
+                mask = pb1 == pb
+                if mask.any():
+                    dqt1[mask] = _BC7_DEQUANT_PB[(cb, pb)][c1[mask]].astype(np.float32)
+            dq_list.extend([dqt0, dqt1])
+
+        # Per-pixel interpolation endpoints from subset membership
+        base = np.where(m0[None, :, None], dq_list[0][:, None, :], dq_list[2][:, None, :])
+        end  = np.where(m0[None, :, None], dq_list[1][:, None, :], dq_list[3][:, None, :])
+        d    = end - base
+        lsq  = np.maximum((d * d).sum(axis=2), np.float32(1e-10))
+        t    = np.clip(((pix - base) * d).sum(axis=2) / lsq, 0, 1)
+        indices = np.searchsorted(bounds, t.ravel()).reshape(k, 16).astype(np.uint8)
+
+        # Anchor handling: suppress MSB at each subset's anchor pixel
+        swap0 = indices[:, 0]      >= anchor_thresh
+        swap1 = indices[:, anchor1] >= anchor_thresh
+        inv   = np.uint8(max_idx)
+        for i in range(16):
+            sw = swap0 if m0[i] else swap1
+            indices[:, i] = np.where(sw, inv - indices[:, i], indices[:, i])
+
+        # Swap endpoints to match corrected index orientation
+        c0_s0, c1_s0, c0_s1, c1_s1 = c_list
+        dq0_s0, dq1_s0, dq0_s1, dq1_s1 = dq_list
+        c0_s0,  c1_s0  = (np.where(swap0[:, None], c1_s0,  c0_s0),
+                           np.where(swap0[:, None], c0_s0,  c1_s0))
+        dq0_s0, dq1_s0 = (np.where(swap0[:, None], dq1_s0, dq0_s0),
+                           np.where(swap0[:, None], dq0_s0, dq1_s0))
+        c0_s1,  c1_s1  = (np.where(swap1[:, None], c1_s1,  c0_s1),
+                           np.where(swap1[:, None], c0_s1,  c1_s1))
+        dq0_s1, dq1_s1 = (np.where(swap1[:, None], dq1_s1, dq0_s1),
+                           np.where(swap1[:, None], dq0_s1, dq1_s1))
+        pb_list[0], pb_list[1] = (np.where(swap0, pb_list[1], pb_list[0]),
+                                   np.where(swap0, pb_list[0], pb_list[1]))
+        pb_list[2], pb_list[3] = (np.where(swap1, pb_list[3], pb_list[2]),
+                                   np.where(swap1, pb_list[2], pb_list[3]))
+
+        # Error (all 4 channels)
+        base_f = np.where(m0[None, :, None], dq0_s0[:, None, :], dq0_s1[:, None, :])
+        end_f  = np.where(m0[None, :, None], dq1_s0[:, None, :], dq1_s1[:, None, :])
+        w      = weights[indices.astype(np.int32)].astype(np.float32)
+        recon  = np.floor((np.float32(64) - w[:, :, None]) * base_f +
+                           w[:, :, None] * end_f + 32) / 64
+        error  = _bc7_error_helper(pix, recon).sum(axis=(1, 2))
+
+        # Pack 128 bits
+        lo = np.zeros(k, np.uint64); hi = np.zeros(k, np.uint64)
+        _bw(lo, hi, 0, 8, np.full(k, np.uint8(128), np.uint8))       # mode 7
+        _bw(lo, hi, 8, 6, np.full(k, pid, np.uint8))                  # partition
+        off = 14
+        eps = [c0_s0, c1_s0, c0_s1, c1_s1]
+        for ch in range(4):
+            for ep in eps:
+                _bw(lo, hi, off, cb, ep[:, ch]); off += cb            # 5 bits each
+        for pb_arr in pb_list:
+            _bw(lo, hi, off, 1, pb_arr); off += 1                     # 4 P-bits
+        for i in range(16):
+            nb = 1 if (i == 0 or i == anchor1) else 2
+            _bw(lo, hi, off, nb, indices[:, i]); off += nb
+        assert off == 128, f"mode 7 pid {pid} bits = {off}"
+
+        out_blocks[sel] = _bc7_pack(lo, hi)
+        out_error[sel]  = error
+
+    return out_blocks, out_error
+
+
 # ── BC7 block selector ────────────────────────────────────────────────────────
 
 def _compress_bc7_s(blocks_rgba, pca=0, lite=False, nano=False, zero=False):
@@ -1296,13 +1430,13 @@ def _compress_bc7_s(blocks_rgba, pca=0, lite=False, nano=False, zero=False):
     pf = blocks_rgba.astype(np.float32)
 
     best_blk, best_err = _bc7_mode6(pf, pca)
-    
+
     blk4, err4 = _bc7_mode4_1(pf, pca)
     better = err4 < best_err
     best_blk[better] = blk4[better]; best_err[better] = err4[better]
 
     if zero: return best_blk
-    
+
     # TODO: skip mode4 variant 0 if alpha is all fully opaque
     blk4, err4 = _bc7_mode4_0(pf, pca)
     better = err4 < best_err
@@ -1312,16 +1446,20 @@ def _compress_bc7_s(blocks_rgba, pca=0, lite=False, nano=False, zero=False):
     better = err5 < best_err
     best_blk[better] = blk5[better]; best_err[better] = err5[better]
 
-    # Share partition search between modes 1 and 3
+    # Share partition search between modes 1, 3, and 7
     pid = _bc7_best_partition(pf[:,:,:3], pf.shape[0], lite=lite, nano=nano)
-    
+
     blk1, err1 = _bc7_encode_2subset(pf, mode=1, pca=pca, best_pid=pid, lite=lite, nano=nano)
     better = err1 < best_err
     best_blk[better] = blk1[better]; best_err[better] = err1[better]
-    
+
     blk3, err3 = _bc7_encode_2subset(pf, mode=3, pca=pca, best_pid=pid, lite=lite, nano=nano)
     better = err3 < best_err
     best_blk[better] = blk3[better]; best_err[better] = err3[better]
+
+    blk7, err7 = _bc7_mode7(pf, pca=pca, best_pid=pid, lite=lite, nano=nano)
+    better = err7 < best_err
+    best_blk[better] = blk7[better]; best_err[better] = err7[better]
 
     if nano: return best_blk
 
