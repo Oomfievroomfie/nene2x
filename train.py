@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from tinygrad import Tensor
+from tinygrad import Tensor, TinyJit
 from tinygrad.nn.optim import AdamW
 from tinygrad.nn.state import get_state_dict, safe_save, safe_load
 
@@ -318,10 +318,25 @@ def train(args: argparse.Namespace):
     opt = AdamW(params, lr=args.lr, b1=0.9, b2=0.999, weight_decay=0.0)
     best_loss = float("inf")
 
+    use_basic_loss = args.basic_loss
+    @TinyJit
+    def train_step(lr_batch: Tensor, res_batch: Tensor) -> Tensor:
+        opt.zero_grad()
+        pred = net(lr_batch)
+        if use_basic_loss:
+            loss = loss_l1(pred, res_batch) + loss_mse(pred, res_batch)
+        else:
+            loss = loss_lE(pred, res_batch)
+        loss.backward()
+        clip_grad_norm_(params, max_norm=1.0)
+        opt.step()
+        for p in params:
+            p.assign(p.clamp(-3.99, 3.99))
+        return loss.realize()
+
     chunk_size = max(1, len(dataset.pairs) // args.precompute_factor)
 
     for epoch in range(start_epoch, args.epochs + 1):
-        # Update LR manually
         new_lr = cosine_lr(epoch - 1, args.epochs, args.lr, args.lr * 0.1)
         opt.lr = Tensor([new_lr])
 
@@ -332,7 +347,6 @@ def train(args: argparse.Namespace):
         end_p   = min(start_p + chunk_size, len(dataset.pairs))
         active_pair_indices = list(range(start_p, end_p))
 
-        # Build index list: patches_per_pair samples per active pair
         indices = active_pair_indices * args.patches_per_pair
         random.shuffle(indices)
 
@@ -354,24 +368,8 @@ def train(args: argparse.Namespace):
             lr_batch  = Tensor(np.stack(lr_list,  axis=0).astype(np.float32))
             res_batch = Tensor(np.stack(res_list, axis=0).astype(np.float32))
 
-            pred = net(lr_batch)
-
-            if not args.basic_loss:
-                loss = loss_lE(pred, res_batch)
-            else:
-                loss = loss_l1(pred, res_batch) + loss_mse(pred, res_batch)
-
-            opt.zero_grad()
-            loss.backward()
-            clip_grad_norm_(params, max_norm=1.0)
-            opt.step()
-
-            # Clamp parameters
-            for p in params:
-                p.assign(p.clamp(-3.99, 3.99))
-
-            loss_val = loss.numpy().item()
-            running_loss += loss_val
+            loss = train_step(lr_batch, res_batch)
+            running_loss += loss.numpy().item()
             steps += 1
 
         avg_loss = running_loss / max(steps, 1)

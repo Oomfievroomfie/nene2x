@@ -4,7 +4,7 @@ model.py  –  2× per-channel image upscaler (tinygrad port)
 
 import math
 import numpy as np
-from tinygrad import Tensor
+from tinygrad import Tensor, TinyJit
 from tinygrad.nn.state import get_state_dict, load_state_dict as tg_load_state_dict
 
 gConfig = "b,3x3_12,3x3_12,3x3_4"
@@ -162,6 +162,10 @@ class UpscaleNet:
         x = self._final_layer(x)
         return pixel_shuffle(x, 2)
 
+    @TinyJit
+    def _jit_call(self, x: Tensor) -> Tensor:
+        return self.__call__(x)
+
     def upscale_channel(self, lr: Tensor) -> Tensor:
         x = lr.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
         x_np = x.numpy()
@@ -171,7 +175,7 @@ class UpscaleNet:
             base_np = upscale_edi_2x_np(x_np, self.is_wrapping)
         base = Tensor(base_np.astype(np.float32))
 
-        residual = self(x)
+        residual = self._jit_call(x)
 
         if not self.padding_enabled:
             _, _, rH, rW = residual.shape
