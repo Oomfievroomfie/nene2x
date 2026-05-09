@@ -238,17 +238,25 @@ def upscale_image(model: UpscaleNet,
         else:
             tensor_pad = np.pad(tensor, ((0,0),(ph,pad),(ph,pad)), mode=pad_mode)
 
+        full_tile_h = stride + 2 * pad
+        full_tile_w = stride + 2 * pad
+        net_chans = [0] if yonly else list(range(C))
         for y0 in range(0, H, stride):
             y1 = min(y0 + stride, H)
             for x0 in range(0, W, stride):
                 x1 = min(x0 + stride, W)
                 tile = tensor_pad[:, y0+stride : y1+stride+2*pad,
                                      x0+stride : x1+stride+2*pad]
-                net_chans = [0] if yonly else list(range(C))
+                th, tw = tile.shape[1], tile.shape[2]
+                if th < full_tile_h or tw < full_tile_w:
+                    tile = np.pad(tile,
+                                  ((0,0),(0, full_tile_h-th),(0, full_tile_w-tw)),
+                                  mode="edge")
+                out_h, out_w = (y1 - y0) * 2, (x1 - x0) * 2
                 for c in net_chans:
                     ch_t = Tensor(tile[c].astype(np.float32))
                     result[c, y0*2+off : y1*2+off, x0*2+off : x1*2+off] = \
-                        model.upscale_channel(ch_t).numpy()
+                        model.upscale_channel(ch_t).numpy()[:out_h, :out_w]
 
         result = result[:, off:off+out_H, off:off+out_W]
 

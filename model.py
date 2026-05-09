@@ -7,6 +7,26 @@ import numpy as np
 from tinygrad import Tensor, TinyJit
 from tinygrad.nn.state import get_state_dict, load_state_dict as tg_load_state_dict
 
+"""
+The network is run on one channel at a time.
+Outputs are the RESIDUAL above EDI or bilinear interpolation, not raw pixel values.
+
+Config string syntax
+────────────────────
+Each comma-separated token is "KxK_C[d]":
+  KxK   – square kernel size
+  C     – number of output channels
+  d     – (optional suffix) depthwise convolution: each channel is convolved
+           independently (groups=in_channels).  e.g. "3x3_8d"
+  n     – (optional suffix) no bias parameters
+
+Global prefix "b," (before the first token) marks a *bilinear-base* model.
+  • The base upscale uses plain bilinear filtering (upsample2x) instead of EDI.
+  • Detected automatically on load: the final weight key is "zfinalb" instead
+    of "zfinal".
+  Example: "b,3x3_12,1x1_12,3x3_24,1x1_4"
+"""
+
 gConfig = "b,3x3_12,3x3_12,3x3_4"
 LEAKY_SLOPE = 0.00005
 
