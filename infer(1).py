@@ -38,14 +38,7 @@ def load_model(weights_path: str, device: torch.device, do_wrap=True) -> Upscale
     state = load_file(weights_path)
     model.load_state_dict(state)
     model.eval().to(device)
-
-    pad = sum((conv.kernel_size[0] - 1) // 2
-              for conv in [*model.layers, model._final_layer]
-              if conv.kernel_size[0] > 1)
-    model.infer_pad = pad
-    if pad > 0:
-        model.set_padding_enabled(False)
-
+    
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {total_params:,}")
     
@@ -239,6 +232,7 @@ def _bilinear_upsample_2x(ch: torch.Tensor) -> torch.Tensor:
 # ── per-image upscaling ───────────────────────────────────────────────────────
 
 timesum = 0
+
 @torch.no_grad()
 def upscale_image(model: UpscaleNet,
                   img: Image.Image,
@@ -246,15 +240,26 @@ def upscale_image(model: UpscaleNet,
                   tile_size: int | None = None,
                   wrap: bool = True,
                   ycgco: bool = False,
-                  yonly: bool = False) -> Image.Image:
+                  yonly: bool = False,
+                  pad: int = 0) -> Image.Image:
     global timesum
     import time
     """
     Upscale one PIL image 2×.
+
+    tile_size  –  if set, process the image in overlapping tiles of this LR
+                  size (useful for very large images that don't fit in VRAM).
+                  Set to e.g. 256 for 8 GB GPU.
+    ycgco      –  if True, convert RGB(A) to YCgCo before upscaling and back
+                  afterwards.  The network sees decorrelated luma/chroma channels
+                  which can improve sharpness.  Grayscale images are unaffected.
+    yonly      –  if True, apply the network only to the Y (luma) channel in
+                  YCgCo space and use corner-aligned bilinear interpolation for
+                  the two chroma channels (and alpha if present).  Implies
+                  --ycgco automatically.  Fastest mode for colour images.
     """
     tensor, mode = _to_float(img)              # (C, H, W)
     tensor = tensor.to(device)
-
     # --yonly implies YCgCo decomposition
     if yonly:
         ycgco = True
@@ -262,70 +267,85 @@ def upscale_image(model: UpscaleNet,
         tensor = _rgb_to_ycgco(tensor)
     C, H, W = tensor.shape
 
-    pad      = model.infer_pad
-    pad_mode = "circular" if wrap else "replicate"
-
     start = time.perf_counter()
-    if tile_size is None or tile_size <= 1:
+    if tile_size is None:
         # ── whole-image path (fastest) ────────────────────────────────────────
-        # Pre-pad once so upscale_channel's conv context is satisfied.
-        if pad > 0:
-            tensor_in = F.pad(tensor.unsqueeze(0), (pad, pad, pad, pad), mode=pad_mode).squeeze(0)
-        else:
-            tensor_in = tensor
+        pad_mode = "circular" if wrap else "replicate"
         channels = []
         for c in range(C):
             if yonly and c != 0:
                 channels.append(_bilinear_upsample_2x(tensor[c]))  # (2H, 2W)
             else:
-                channels.append(model.upscale_channel(tensor_in[c]))  # (2H, 2W)
+                ch = tensor[c]  # (H, W)
+                if pad > 0:
+                    ch = F.pad(ch[None, None], (pad, pad, pad, pad), mode=pad_mode).squeeze(0).squeeze(0)
+                channels.append(model.upscale_channel(ch))  # (2H, 2W)
         result = torch.stack(channels, dim=0)                   # (C, 2H, 2W)
     else:
         # ── tiled path (memory-safe for large images) ─────────────────────────
-        stride        = tile_size
-        out_H, out_W  = H * 2, W * 2
-        off           = 1   # output offset to avoid DirectML x=0/y=0 bug
-        result        = torch.zeros(C, out_H + off, out_W + off, device=device)
- 
-        # Pad the original tensor once for tile context, with an extra `stride`
-        # pixels on the top/left so every tile slice starts at index >= stride,
-        # working around a DirectML bug with slices starting at x=0 or y=0.
-        ph = pad + stride
-        if pad_mode == "circular" and (ph >= H or pad >= W or stride >= W):
-            # F.pad forbids padding larger than the tensor; use index sampling.
-            total_h = H + ph + pad
-            total_w = W + ph + pad
-            ys = (torch.arange(total_h, device=device) - ph) % H
-            xs = (torch.arange(total_w, device=device) - ph) % W
-            tensor_pad = tensor[:, ys][:, :, xs]
-        else:
-            tensor_pad = F.pad(tensor.unsqueeze(0),
-                               (ph, pad, ph, pad),
-                               mode=pad_mode).squeeze(0)
- 
-        for y0 in range(0, H, stride):
-            y1 = min(y0 + stride, H)
-            for x0 in range(0, W, stride):
+        stride = tile_size   # LR pixels per tile (without overlap)
+        out_H, out_W = H * 2, W * 2
+
+        result = torch.zeros(C, out_H, out_W, device=device)
+
+        y_starts = range(0, H, stride)
+        x_starts = range(0, W, stride)
+
+        # THIS INTENTIONALLY DOES NOT FADE. FADING IS INCORRECT.
+        # We only need 4 or 5 pixels of support on each side. Fading would be stupid.
+
+        # Pad the entire tensor once to handle edge tiles easily
+        # +1 because bilinear baseline needs 1 more pixel than the network's pad context
+        P = pad + 1
+        pad_mode = "circular" if wrap else "replicate"
+        tensor_pad = F.pad(tensor.unsqueeze(0), (P, P, P, P), mode=pad_mode).squeeze(0)
+
+        for y0 in y_starts:
+            for x0 in x_starts:
+                y1 = min(y0 + stride, H)
                 x1 = min(x0 + stride, W)
+                
+                # Fetch tile with 5-pixel padding (for bilinear)
+                tile_lr5 = tensor_pad[:, y0 : y1 + 2*P, x0 : x1 + 2*P].unsqueeze(0)
+                
+                # Fetch tile with 4-pixel padding (for network)
+                tile_lr = tensor_pad[:, y0 + 1 : y1 + 2*P - 1, x0 + 1 : x1 + 2*P - 1]
 
-                # Original pixel (y0,x0) now sits at (y0+pad+stride, x0+pad+stride).
-                # Slicing [y0+stride : y1+stride+2*pad] gives pad pixels of context
-                # on both sides, and the slice always starts at >= stride > 0.
-                tile = tensor_pad[:, y0+stride : y1+stride+2*pad, x0+stride : x1+stride+2*pad]
+                # Bilinear baseline for this padded tile
+                base_pad = F.interpolate(
+                    tile_lr5, scale_factor=2,
+                    mode="bilinear", align_corners=False
+                ).squeeze(0)
+                
+                # Crop off the 1 LR pixel (2 HR pixels) of extra bilinear context
+                tile_base = base_pad[:, 2:-2, 2:-2]
 
+                # Network residual – only luma (c=0) when --yonly, else all channels
                 net_chans = [0] if yonly else list(range(C))
+                tile_res_channels = []
                 for c in net_chans:
-                    result[c, y0*2+off : y1*2+off, x0*2+off : x1*2+off] = model.upscale_channel(tile[c])
+                    ch = tile_lr[c:c+1].unsqueeze(0)           # (1,1,th,tw)
+                    res = model(ch).squeeze(0)                 # (1,2th,2tw)
+                    tile_res_channels.append(res)
+                tile_res = torch.cat(tile_res_channels, dim=0) # (len(net_chans),2th,2tw)
 
-        result = result[:, off:off+out_H, off:off+out_W]
+                tile_hr = (tile_base[net_chans] + tile_res).clamp(0, 1)
 
-        # --yonly: upsample chroma and alpha on the full image for efficiency
+                # Crop off the 4-pixel LR safety padding (= 8 HR pixels), keeping core
+                valid_hr = tile_hr[:, pad*2:-pad*2, pad*2:-pad*2]
+
+                # Paste into result (only for the network-processed channels)
+                for i, c in enumerate(net_chans):
+                    result[c, y0*2:y1*2, x0*2:x1*2] = valid_hr[i]
+
+        # --yonly: bilinear-upsample chroma (channels 1, 2) and alpha (3) in one
+        # shot on the full image – cheaper than tiling and avoids tile boundaries.
         if yonly:
             for c in range(1, C):
                 result[c] = _bilinear_upsample_2x(tensor[c])
 
     end = time.perf_counter()
-    timesum += end - start
+    timesum += end-start
     
     if ycgco:
         result = _ycgco_to_rgb(result)
@@ -352,6 +372,13 @@ def process(args: argparse.Namespace):
     print(f"Device : {device}")
     model = load_model(args.model, device, args.wrap)
     print(f"Weights: {args.model}")
+
+    pad = sum((conv.kernel_size[0] - 1) // 2
+              for conv in [*model.layers, model._final_layer]
+              if conv.kernel_size[0] > 1)
+    print(f"Receptive field pad: {pad} LR px")
+    if pad > 0:
+        model.set_padding_enabled(False)
 
     inp = Path(args.input)
 
@@ -383,7 +410,8 @@ def process(args: argparse.Namespace):
                                    tile_size=args.tile_size,
                                    wrap=args.wrap,
                                    ycgco=args.ycgco,
-                                   yonly=args.yonly)
+                                   yonly=args.yonly,
+                                   pad=pad)
 
             if args.gridline_removal:
                 result = remove_gridlines(result)
@@ -397,26 +425,15 @@ def process(args: argparse.Namespace):
                 # preserve extension; fall back to .png for formats that PIL
                 # can't losslessly round-trip
                 ext = path.suffix.lower()
-                #if ext in {".jpg", ".jpeg"}:
-                #    ext = ".png"   # avoid re-compression loss
-                ext = ".png"
-                if not args.extension is None and args.extension != "":
-                    ext = args.extension
-                #dest = out_dir / (path.stem + "_2x" + ext)
-                dest = out_dir / (path.stem + ext)
+                if ext in {".jpg", ".jpeg"}:
+                    ext = ".png"   # avoid re-compression loss
+                dest = out_dir / (path.stem + "_2x" + ext)
 
-            if ext == ".dds":
-                if len(result.getbands()) == 4:
-                    result.save(dest, pixel_format="DXT5")
-                else:
-                    result.save(dest, pixel_format="DXT1")
-            else:
-                result.save(dest)
+            result.save(dest)
             print(f"  {path.name}  {img.size} → {result.size}  →  {dest.name}")
 
         except Exception as e:
             print(f"  ERROR {path.name}: {e}")
-            throw(e)
 
     print(f"Elapsed for all inference: {timesum:.6f}s")
     
@@ -432,10 +449,9 @@ def main():
     p.add_argument("--output", "-o", default=None,
                    help="Output file (single input) or folder (directory input). "
                         "Default: <input>_2x.png  /  <input_dir>/upscaled/")
-    p.add_argument("--extension", "-e", default=None, help="Extension override, e.g. .dds")
-    p.add_argument("--tile-size", type=int, default=256,
+    p.add_argument("--tile-size", type=int, default=None,
                    help="Process in LR tiles of this size (e.g. 256) to reduce "
-                        "VRAM usage on large images.  Default: 256.  0 to disable.")
+                        "VRAM usage on large images.  Default: whole image at once.")
     p.add_argument("--wrap", action="store_true")
     p.add_argument("--ycgco", action="store_true",
                    help="Convert RGB(A) to YCgCo before upscaling and back afterwards. "

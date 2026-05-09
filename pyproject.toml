@@ -3,8 +3,8 @@ name = "upscaler"
 version = "0.1.0"
 requires-python = "==3.10.*"
 dependencies = [
-    "torch-directml==0.2.0dev230426",
-    #"torch>=2.4.0",
+    #"torch-directml==0.2.0dev230426",
+    "torch>=2.4.0",
     "pillow>=10.0.0",
     "numpy==1.23.*",
     "safetensors>=0.8.0rc0",
@@ -13,6 +13,8 @@ dependencies = [
     "scipy>=1.15.3",
     "scikit-image>=0.24.0",
     "lpips>=0.1.4",
+    "numexpr>=2.14.1",
+    "tinygrad>=0.11.0",
 ]
 
 [tool.uv.workspace]

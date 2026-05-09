@@ -10,9 +10,25 @@ Architecture (per channel):
 
 The network is run on one channel at a time.
 Outputs are the RESIDUAL above bilinear interpolation, not raw pixel values.
+
+Config string syntax
+────────────────────
+Each comma-separated token is "KxK_C[d]":
+  K×K   – square kernel size
+  C     – number of output channels
+  d     – (optional suffix) depthwise convolution: each channel is convolved
+           independently (groups=in_channels).  e.g. "3x3_8d"
+  n     – (optional suffix) no bias parameters
+
+Global prefix "b," (before the first token) marks a *bilinear-base* model.
+  • The base upscale uses plain bilinear filtering (upsample2x) instead of EDI.
+  • Detected automatically on load: the final weight key is "zfinalb" instead
+    of "zfinal".
+  Example: "b,3x3_12,1x1_12,3x3_24,1x1_4"
 """
 
 import torch
+import tinygrad.frontend.torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -80,7 +96,7 @@ import torch.nn.functional as F
 #gConfig = "3x3_10,3x3_6,1x1_6,3x3_4" # 908 params. gets stuck.
 #gConfig = "3x3_8,3x3_8,3x3_4" # 956 params (yes). 36.6.
 #gConfig = "3x3_10,1x1_8,3x3_8,1x1_4,3x3_4" # 956 params (yes). bad too
-#gConfig = "3x3_10,1x1_8,3x3_8,3x3_4" # 1064 params. 37+db psnr
+#gConfig = "3x3_10,1x1_8,3x3_8,3x3_4" # 1064 params. 37+db psnr ---- 
 #gConfig = "3x3_4,3x3_8,1x1_8,3x3_8,1x1_4,1x1_4" # 1048 params. garbage.
 #gConfig = "3x3_4,3x3_8,1x1_8,3x3_8,1x1_4" # 1028 params. 36.7, bad.
 #gConfig = "3x3_4,3x3_12,1x1_4" # 536 params. 36.3db psnr.
@@ -90,35 +106,76 @@ import torch.nn.functional as F
 #gConfig = "3x3_4,1x1_4,3x3_4,1x1_4" # 228 params. 34.4, garbage.
 #gConfig = "3x3_8,1x1_4,3x3_4" # 264 params. 34.8db psnr.
 #gConfig = "3x3_8,1x1_4" # 116 params. 34.35 psnr
-gConfig = "3x3_8,1x1_4" # 
+#gConfig = "3x3_8,3x3_8dn,1x1_4" # 188 params. 34.75 psnr
+#gConfig = "3x3_8,1x1_6,3x3_12d,1x1_4n" # 306 params. easily 35.9+ db psnr
+#gConfig = "3x3_8,1x1_4,3x3_8d,1x1_4n" # 228 params. 35.1db psnr
+#gConfig = "1x3_4,3x1_8d,1x1_4n" # 120 params. 33.8db psnr
+#gConfig = "3x3_6,3x3_6d,1x1_4n" # 144 params. 34.8db psnr
+#gConfig = "3x3_10,1x1_8,3x3_16d,1x1_8,3x3_4n" # 772 params. 36.8 psnr
+#gConfig = "3x3_8,3x3_24d,1x1_8,3x3_4n" # 808 params. 37+ psnr
+
+#gConfig = "b,3x3_6,1x1_6,1x1_4" # 130 params. unfortunately, too small.
+#gConfig = "3x3_10,1x1_6,1x1_4n" # 180 params. 35.1db psnr
+#gConfig = "3x3_24,3x3_96d,1x1_24,3x3_96d,1x1_32,1x1_4" # 6000 params. 
+#gConfig = "3x3_24,3x3_32,1x1_24,3x3_24,1x1_16,1x1_4" # ... OLD. 13.6k ...
+#gConfig = "3x3_12,3x3_72d,1x1_24,3x3_24,1x1_24,1x1_4" # 8500 params. 38.9db psnr. worse than 3x3_16,3x3_24,1x1_24,3x3_24,1x1_16,1x1_4
+#gConfig = "3x3_12,3x3_32,1x1_24,3x3_96d,1x1_24,1x1_4" # 7788 params. 38.94db psnr.
+#gConfig = "3x3_12,3x3_32,1x1_24,3x3_120d,1x1_24,1x1_4" # 8604 params. stuck at 38
+
+gConfig = "3x3_24,3x3_48,1x1_64,3x3_320d,1x1_32,3x3_24,1x1_4" # 34k params. goal is 39.7~39.9 psnr.
 
 
 # Intentionally extremely barely-leaky slope so that inference can treat the layer as ReLU instead of LeakyReLU.
-# If this causes checkerboard/scanline artifacts in a given model, finish off the model with:
-#  uv run python train.py train --epochs 150 --resume FILENAME.safetensors --lr 0.0005 --strict-validation --leaky-slope 0.00001 --basic-loss
+# If this causes checkerboard/scanline artifacts in a given model, run a fine-tuning run with train.py --resume
+#  and a low learning rate (e.g. 0.0005) and --leaky-slope 0.00001 Doing so will
+#  fine-tune with true ReLU and get rid of the artifacts.
+#LEAKY_SLOPE = 0.0002
 LEAKY_SLOPE = 0.00005
 
 
-def _parse_config(cfg: str) -> list:
-    """Parse a config string into a list of (kernel_size, out_channels) tuples.
+def _parse_config(cfg: str) -> tuple:
+    """Parse a config string into (specs, is_bilinear).
 
-    Example: "3x3.12,1x1.48,1x1.4"  →  [(3, 12), (1, 48), (1, 4)]
+    specs       – list of (kernel_size, out_channels, is_depthwise, no_bias) 4-tuples
+    is_bilinear – True when the string starts with the "b," prefix
+
+    Suffix flags (append after the channel count in any order):
+      d – depthwise: convolution stays within each channel (groups=in_channels)
+      n – no bias:   bias term is omitted from the Conv2d
+
+    Examples:
+      "3x3_12,1x1_4"      →  ([(3,12,False,False),(1,4,False,False)], False)
+      "b,3x3_12,1x1_4"    →  ([(3,12,False,False),(1,4,False,False)], True)
+      "3x3_8d,1x1_4"      →  ([(3,8,True,False),(1,4,False,False)],  False)
+      "3x3_8n,1x1_4"      →  ([(3,8,False,True),(1,4,False,False)],  False)
+      "3x3_8dn,1x1_4"     →  ([(3,8,True,True),(1,4,False,False)],   False)
     """
+    is_bilinear = cfg.startswith("b,")
+    if is_bilinear:
+        cfg = cfg[2:]
     specs = []
     for token in cfg.split(","):
         token = token.strip()
+        # Strip suffix flags in any order; collect them as a set.
+        flags = set()
+        while token[-1] in ("d", "n"):
+            flags.add(token[-1])
+            token = token[:-1]
         kpart, c_str = token.split("_")
         k = int(kpart.split("x")[0])   # KxK assumed square
-        specs.append((k, int(c_str)))
+        specs.append((k, int(c_str), "d" in flags, "n" in flags))
     assert specs[-1][1] == 4, (
         f"Final layer must output exactly 4 channels for PixelShuffle×2, got {specs[-1][1]}"
     )
-    return specs
+    return specs, is_bilinear
 
 
-def _config_to_str(specs: list) -> str:
+def _config_to_str(specs: list, is_bilinear: bool = False) -> str:
     """Inverse of _parse_config."""
-    return ",".join(f"{k}x{k}.{c}" for k, c in specs)
+    def _token(k, c, dw, nb):
+        return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}"
+    body = ",".join(_token(*s) for s in specs)
+    return ("b," + body) if is_bilinear else body
 
 
 class UpscaleNet(nn.Module):
@@ -129,42 +186,85 @@ class UpscaleNet(nn.Module):
 
     def __init__(self, is_wrapping=False):
         super().__init__()
+        self.padding_enabled = True
         self.is_wrapping = is_wrapping
         self.act = nn.LeakyReLU(LEAKY_SLOPE, inplace=True)
-        self._build_layers(_parse_config(gConfig))
+        specs, is_bilinear = _parse_config(gConfig)
+        self.is_bilinear = is_bilinear
+        self._build_layers(specs)
         self._init_weights()
 
     @staticmethod
-    def _config_from_state(state: dict) -> list:
-        """Recover the layer spec list entirely from weight tensor shapes."""
+    def _config_from_state(state: dict) -> tuple:
+        """Recover the layer spec list and is_bilinear flag from weight tensor shapes.
+
+        Returns (specs, is_bilinear) where specs is a list of
+        (kernel_size, out_channels, is_depthwise, no_bias) 4-tuples.
+
+        Bilinear detection: the final weight key is "zfinalb.weight" instead of
+        "zfinal.weight".
+
+        Depthwise detection: a Conv2d with groups=in_channels stores weights of
+        shape (out_c, 1, k, k).  For the very first layer in_c is always 1, so
+        we cannot distinguish – it is assumed non-depthwise.
+
+        No-bias detection: the corresponding ".bias" key is absent from state.
+        """
+        is_bilinear = "zfinalb.weight" in state
+        final_key = "zfinalb.weight" if is_bilinear else "zfinal.weight"
+        final_pfx = "zfinalb"        if is_bilinear else "zfinal"
+        assert final_key in state, f"No '{final_key}' found in state dict"
+
         keys = sorted(
             k for k in state if k.startswith("layers.") and k.endswith(".weight")
         )
-        assert "zfinal.weight" in state, "No 'zfinal.weight' found in state dict"
-        specs = [(state[k].shape[2], state[k].shape[0]) for k in keys]
-        w = state["zfinal.weight"]
-        specs.append((w.shape[2], w.shape[0]))
-        return specs
+        specs = []
+        for i, k in enumerate(keys):
+            w = state[k]
+            pfx = k[:-len(".weight")]          # e.g. "layers.0"
+            # shape[1]==1 on a non-first layer means depthwise (groups=in_c).
+            # The first layer always has shape[1]==1 regardless, so skip it.
+            is_depthwise = (i > 0) and (w.shape[1] == 1)
+            no_bias = (pfx + ".bias") not in state
+            specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
+
+        w = state[final_key]
+        # zfinal is depthwise only when there are preceding layers to compare against.
+        is_depthwise = (len(keys) > 0) and (w.shape[1] == 1)
+        no_bias = (final_pfx + ".bias") not in state
+        specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
+        return specs, is_bilinear
 
     def _build_layers(self, specs: list):
-        """(Re-)construct all learnable layers from a list of (kernel_size, out_channels)."""
+        """(Re-)construct all learnable layers from a list of
+        (kernel_size, out_channels, is_depthwise, no_bias) 4-tuples."""
         in_c = 1
         convs = []
-        for k, out_c in specs:
+        for k, out_c, is_depthwise, no_bias in specs:
             pad = (k - 1) // 2
             # Only use a non-zero padding_mode when there is actual padding.
             # When padding=0 (e.g. 1x1 layers), leave padding_mode at the default
             # 'zeros' so PyTorch takes the fast cudnn path instead of F.pad + conv.
             pm = ("circular" if self.is_wrapping else "replicate") if pad > 0 else "zeros"
-            convs.append(nn.Conv2d(in_c, out_c, kernel_size=k, padding=pad, padding_mode=pm))
+            groups = in_c if is_depthwise else 1
+            convs.append(nn.Conv2d(in_c, out_c, kernel_size=k, padding=pad,
+                                   padding_mode=pm, groups=groups, bias=not no_bias))
             in_c = out_c
         # Keep the final layer separate so forward() never needs a [:-1] slice.
+        # The name encodes the base-upscale type so it can be detected on load.
         self.layers = nn.ModuleList(convs[:-1])
-        self.zfinal  = convs[-1]
+        final_attr = "zfinalb" if self.is_bilinear else "zfinal"
+        setattr(self, final_attr, convs[-1])
+        # Remove the stale attribute when switching between bilinear and EDI modes.
+        for stale in ("zfinal", "zfinalb"):
+            if stale != final_attr and hasattr(self, stale):
+                delattr(self, stale)
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         """Infer architecture from *state_dict* shapes, rebuild layers, then load."""
-        self._build_layers(self._config_from_state(state_dict))
+        specs, is_bilinear = self._config_from_state(state_dict)
+        self.is_bilinear = is_bilinear
+        self._build_layers(specs)
         self._init_weights()
         return super().load_state_dict(state_dict, strict=strict)
 
@@ -186,10 +286,16 @@ class UpscaleNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    @property
+    def _final_layer(self) -> nn.Conv2d:
+        """The final Conv2d, regardless of whether the model is bilinear or EDI."""
+        return self.zfinalb if self.is_bilinear else self.zfinal
+
     def set_padding_enabled(self, enabled: bool):
         """Toggle replicate/circular padding on spatial layers.
         Disable during training when patches are pre-padded with real data."""
-        for conv in [*self.layers, self.zfinal]:
+        self.padding_enabled = enabled
+        for conv in [*self.layers, self._final_layer]:
             if conv.kernel_size[0] > 1:
                 if enabled:
                     pad = (conv.kernel_size[0] - 1) // 2
@@ -203,19 +309,22 @@ class UpscaleNet(nn.Module):
         """x: (B, 1, H, W)  →  (B, 1, 2H, 2W) residual"""
         for conv in self.layers:
             x = self.act(conv(x))
-        x = self.zfinal(x)               # no activation on final layer
+        x = self._final_layer(x)         # no activation on final layer
         return F.pixel_shuffle(x, 2)    # (B, 4, H, W) → (B, 1, 2H, 2W)
 
     @torch.no_grad()
     def upscale_channel(self, lr: torch.Tensor) -> torch.Tensor:
-        """
-        Upscale one image channel.
-        lr : (H, W) float32 tensor in [0, 1]
-        returns : (2H, 2W) float32 tensor clamped to [0, 1]
-        """
-        x        = lr.unsqueeze(0).unsqueeze(0)          # (1, 1, H, W)
-        base     = upscale_edi_2x(x, self.is_wrapping)  # (1, 1, 2H, 2W)
+        x        = lr.unsqueeze(0).unsqueeze(0)
+        if self.is_bilinear:
+            base = upsample2x(x, self.is_wrapping)
+        else:
+            base = upscale_edi_2x(x, self.is_wrapping)
         residual = self(x)
+        if not self.padding_enabled:
+            _, _, rH, rW = residual.shape
+            _, _, bH, bW = base.shape
+            dH, dW = (bH - rH) // 2, (bW - rW) // 2
+            base = base[:, :, dH:dH+rH, dW:dW+rW]
         return (base + residual).squeeze(0).squeeze(0).clamp(0.0, 1.0)
 
 

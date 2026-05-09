@@ -58,7 +58,7 @@ def run_comparison(gt_path, est_path, args):
     est_gray1 = fft2_power_of_2(est_gray).real
     
     img = Image.fromarray(gt_gray1.astype(int)).convert('RGB')
-    img.save('gtest.png')
+    #img.save('gtest.png') # for debugging
 
     print(gt_gray1.shape)
     print(gt_gray1[5][4])
@@ -79,7 +79,21 @@ def run_comparison(gt_path, est_path, args):
     bvoi_total = sum(voi_func(gt_binned, est_binned))
 
     mae_val = mae_func(gt_arr, est_arr, data_range=255)
-
+    
+    # --- AED Calculation ---
+    # 1. Fully average the two images (per RGB channel)
+    gt_rgb_avg = np.mean(gt_arr * (1.0/255.0), axis=(0, 1)) 
+    est_rgb_avg = np.mean(est_arr * (1.0/255.0), axis=(0, 1))
+    
+    # 2. Subtract averaged pred from averaged gt
+    # 3. Take the 1/8 power (using absolute value to avoid complex numbers if diff is negative)
+    diff_rgb = gt_rgb_avg - est_rgb_avg
+    aed_per_channel = np.sign(diff_rgb) * np.power(np.abs(diff_rgb), 1.0/2.0)
+    
+    # 4. Average RGB together finally
+    aed_val = np.mean(np.abs(aed_per_channel))
+    # -----------------------
+    
     lpips_val = None
     if args.lpips:
         torch, lpips_lib = load_lpips()
@@ -93,15 +107,16 @@ def run_comparison(gt_path, est_path, args):
     # Output Formatting
     print("-" * 50)
     print(f"Metrics for: {est_path}")
-    print(f"PSNR:     {psnr_val:7.2f}  (Better: Higher)")
-    print(f"DFT PSNR: {dftpsnr_val:7.2f}  (Better: Higher)")
-    print(f"SSIM:     {ssim_val:7.4f}  (Better: Higher)")
-    print(f"NMI:      {nmi_val:7.4f}  (Better: Higher)")
-    print(f"MAE:      {mae_val:7.4f}  (Better: Lower)")
-    print(f"VOI:      {voi_total:7.4f}  (Better: Lower)")
-    print(f"B-VOI:    {bvoi_total:7.4f}  (Better: Lower)")
+    print(f"PSNR:        {psnr_val:7.2f}  (Better: Higher)")
+    print(f"DFT PSNR:    {dftpsnr_val:7.2f}  (Better: Higher)")
+    print(f"SSIM:        {ssim_val:7.4f}  (Better: Higher)")
+    print(f"NMI:         {nmi_val:7.4f}  (Better: Higher)")
+    print(f"MAE:         {mae_val:7.4f}  (Better: Lower)")
+    print(f"VOI:         {voi_total:7.4f}  (Better: Lower)")
+    print(f"B-VOI:       {bvoi_total:7.4f}  (Better: Lower)")
     if lpips_val is not None:
-        print(f"LPIPS:    {lpips_val:7.4f}  (Better: Lower)")
+        print(f"LPIPS (Alex):{lpips_val:7.4f}  (Better: Lower)")
+    print(f"AED:         {aed_val:7.4f}  (Better: Closer to Zero)")
     print("-" * 50)
 
 if __name__ == "__main__":

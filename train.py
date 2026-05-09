@@ -45,7 +45,7 @@ from tqdm import tqdm
 from safetensors.torch import save_file, load_file
 
 from model import (UpscaleNet, gaussian_blur,
-                   manual_downscale2x, upscale_edi_2x)
+                   manual_downscale2x, upscale_edi_2x, upsample2x)
 
 
 # ── loss helpers ──────────────────────────────────────────────────────────────
@@ -171,14 +171,18 @@ class UpscaleDataset(Dataset):
         brightness_range: float = 0.15,
         precompute_factor: int = 1,
         pad: int = 0,
+        baseline_fn=None,
     ):
-        self.patch_size       = patch_size
-        self.patches_per_pair = patches_per_pair
+        self.patch_size        = patch_size
+        self.patches_per_pair  = patches_per_pair
         self.precompute_factor = precompute_factor
-        self.pad              = pad
+        self.pad               = pad
+        # baseline_fn(lr_tensor) -> 2x upscaled tensor used as the residual base.
+        # Defaults to EDI (upscale_edi_2x); pass upsample2x for bilinear models.
+        self.baseline_fn = baseline_fn if baseline_fn is not None else upscale_edi_2x
 
         # Precomputed storage: list of (lr, residual), both (C, H/2, W/2) / (C, H, W)
-        self.pairs: list[tuple[torch.Tensor, torch.Tensor]] =[]
+        self.pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._load(Path(folder), n_aug, brightness_range)
 
         if not self.pairs:
@@ -195,13 +199,15 @@ class UpscaleDataset(Dataset):
         for p in tqdm(paths, desc="Preprocessing images"):
             try:
                 hr = _load_as_float(p)
-                self._add_image(hr, n_aug, brightness_range)
+                self._add_image(hr, n_aug, brightness_range, self.baseline_fn)
             except Exception as e:
                 print(f"  skip {p.name}: {e}")
         
         random.shuffle(self.pairs) 
 
-    def _add_image(self, hr: torch.Tensor, n_aug: int, brightness_range: float):
+    def _add_image(self, hr: torch.Tensor, n_aug: int, brightness_range: float, baseline_fn=None):
+        if baseline_fn is None:
+            baseline_fn = self.baseline_fn
         hr_blur = gaussian_blur(hr)
 
         # The three blur variants are options, not an outer loop.
@@ -214,7 +220,7 @@ class UpscaleDataset(Dataset):
         # Downscale and upscale once per image per variant, not per augmentation.
         # Rotation/flip commute with both ops; brightness offset is applied afterward.
         precomputed = {
-            id(hr_for_lr): (manual_downscale2x(hr_for_lr), upscale_edi_2x(manual_downscale2x(hr_for_lr)))
+            id(hr_for_lr): (manual_downscale2x(hr_for_lr), baseline_fn(manual_downscale2x(hr_for_lr)))
             for _, hr_for_lr in blur_variants
         }
 
@@ -428,7 +434,7 @@ def train(args: argparse.Namespace):
     # Total LR-space receptive field padding — used to pre-pad training patches
     # so the network never has to pad during the forward pass.
     pad = sum((conv.kernel_size[0] - 1) // 2
-              for conv in [*model.layers, model.zfinal]
+              for conv in [*model.layers, model._final_layer]
               if conv.kernel_size[0] > 1)
     print(f"Receptive field pad: {pad} LR px")
     if pad > 0:
@@ -441,6 +447,7 @@ def train(args: argparse.Namespace):
     
     
     # Dataset / loader
+    baseline_fn = upsample2x if model.is_bilinear else upscale_edi_2x
     dataset = UpscaleDataset(
         args.data,
         patch_size=args.patch_size,
@@ -449,6 +456,7 @@ def train(args: argparse.Namespace):
         brightness_range=args.brightness_range,
         precompute_factor=args.precompute_factor,
         pad=pad,
+        baseline_fn=baseline_fn,
     )
 
     sampler = ChunkedRandomSampler(
@@ -493,6 +501,7 @@ def train(args: argparse.Namespace):
         brightness_range=args.brightness_range,
         precompute_factor=1,
         pad=pad,
+        baseline_fn=baseline_fn,
     )
     print(f"Validation set: {len(val_dataset.pairs)} pairs")
 
