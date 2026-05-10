@@ -50,6 +50,10 @@ _PARTITION_PCA: bool = True
 # Tried this, but it doesn't actually really help lol
 _ERROR_DIFFUSION: bool = False
 
+# When True, _compress_bc7_s picks a mode uniformly at random per block instead
+# of by lowest error.  Useful for exercising every decoder path.
+_DEBUG_RANDOM: bool = True
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _pack_565(rgb):
@@ -102,9 +106,13 @@ def einsum_ij(a, b):
 def np_mean(a, **kwargs):
     return np.mean(a, **kwargs)
 
-def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4, no_inset=False):
+def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4, no_inset=False, emphasize_alpha=0):
     """PCA endpoint selection via power iteration.
     pixels: (n, 16, C) float32 → e0, e1: (n, C) float32."""
+    alpha_w = np.float32(float(emphasize_alpha)) if emphasize_alpha != 0 and pixels.shape[2] == 4 else np.float32(1.0)
+    if alpha_w != 1.0:
+        pixels = pixels.copy()
+        pixels[:, :, 3] *= alpha_w
     C = pixels.shape[2]
     mean = np_mean(pixels, axis=1, keepdims=True)                    # (n, 1, C)
     centered = pixels - mean                                     # (n, 16, C)
@@ -200,6 +208,11 @@ def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4, no_inset=False):
     e0 = mean_color + t0 * v
     e1 = mean_color + t1 * v
 
+    if alpha_w != 1.0:
+        e0 = e0.copy(); e0[:, 3] /= alpha_w
+        e1 = e1.copy(); e1[:, 3] /= alpha_w
+        mean_color = mean_color.copy(); mean_color[:, 3] /= alpha_w
+
     def clip_to_ray(e):
         d = e - mean_color
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -213,23 +226,23 @@ def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4, no_inset=False):
 
 from multiprocessing.pool import ThreadPool
 
-def _pca_endpoints_p(pixels, iterations=3, gd_iters=3, indexes=4, num_threads=3):
+def _pca_endpoints_p(pixels, iterations=3, gd_iters=3, indexes=4, num_threads=3, emphasize_alpha=0):
     """
     Threaded wrapper for _pca_endpoints.
     Parallelizes over the massive 'n' dimension (axis=0).
     """
     n = pixels.shape[0]
-    
+
     # If the array is small enough, skip threading to avoid overhead
     if n <= 5000:
-        return _pca_endpoints(pixels, iterations=iterations, gd_iters=gd_iters, indexes=indexes)
-        
+        return _pca_endpoints(pixels, iterations=iterations, gd_iters=gd_iters, indexes=indexes, emphasize_alpha=emphasize_alpha)
+
     # Split the massive batch dimension 'n' into chunks
     # np.array_split handles arrays that aren't perfectly divisible by num_threads
     chunks = np.array_split(pixels, num_threads, axis=0)
-    
+
     def worker(chunk):
-        return _pca_endpoints(chunk, iterations=iterations, gd_iters=gd_iters, indexes=indexes)
+        return _pca_endpoints(chunk, iterations=iterations, gd_iters=gd_iters, indexes=indexes, emphasize_alpha=emphasize_alpha)
         
     with ThreadPool(num_threads) as pool:
         results = pool.map(worker, chunks)
@@ -551,7 +564,11 @@ def _bc7_mode6(pixels, pca=0):
 
     # Endpoint selection — always use ≥1 PCA iteration for BC7 (bbox alone
     # produces off-axis endpoints that are catastrophic at 4-bit indexing)
-    e0r, e1r = _pca_endpoints(pixels, iterations=max(pca, 1), indexes=16)
+    
+    # We need to emphasize alpha for mode 6 too, just like for mode 7.
+    # We INTENTIONALLY do not do it by emulating alpha premultiplication or monocolor-flushing...
+    # ...because doing so would negatively impact non-"color" textures (e.g. normal-height-AO maps)
+    e0r, e1r = _pca_endpoints(pixels, iterations=max(pca, 1), indexes=16, gd_iters=0, no_inset=True, emphasize_alpha=2)
 
     # Quantise: 7 colour bits + 1 unique P-bit = full 8-bit
     # Try both P-bit values, pick lowest total error per endpoint
@@ -575,8 +592,12 @@ def _bc7_mode6(pixels, pca=0):
     r0 = (c7_0.astype(np.int32) << 1 | p0[:,None]).astype(np.float32)
     r1 = (c7_1.astype(np.int32) << 1 | p1[:,None]).astype(np.float32)
 
+    p2 = pixels * np.array([1, 1, 1, 2], dtype=np.float32)
+    r0_2 = r0   * np.array([1, 1, 1, 2], dtype=np.float32)
+    r1_2 = r1   * np.array([1, 1, 1, 2], dtype=np.float32)
+    
     # Index assignment
-    indices = _bc7_project_idx(pixels, r0, r1, _BC7_B4)
+    indices = _bc7_project_idx(p2, r0_2, r1_2, _BC7_B4)
 
     # Anchor: pixel 0, 4-bit → MSB threshold 8
     swap = indices[:, 0] >= 8
@@ -1345,7 +1366,7 @@ def _bc7_mode7(pixels, pca=0, best_pid=None, lite=False, nano=False):
 
         for m in (m0, m1):
             sub = pix[:, m, :]   # (k, count, 4)
-            ehi, elo = _pca_endpoints(sub, iterations=max(pca, 1), indexes=max_idx + 1, gd_iters=0, no_inset=True)
+            ehi, elo = _pca_endpoints(sub, iterations=max(pca, 1), indexes=max_idx + 1, gd_iters=0, no_inset=True, emphasize_alpha=4)
 
             c0, pb0 = _quant_ep_rgba(ehi)
             c1, pb1 = _quant_ep_rgba(elo)
@@ -1367,8 +1388,9 @@ def _bc7_mode7(pixels, pca=0, best_pid=None, lite=False, nano=False):
         base = np.where(m0[None, :, None], dq_list[0][:, None, :], dq_list[2][:, None, :])
         end  = np.where(m0[None, :, None], dq_list[1][:, None, :], dq_list[3][:, None, :])
         d    = end - base
-        lsq  = np.maximum((d * d).sum(axis=2), np.float32(1e-10))
-        t    = np.clip(((pix - base) * d).sum(axis=2) / lsq, 0, 1)
+        aw   = np.array([1, 1, 1, 2], dtype=np.float32)
+        lsq  = np.maximum((d * d * aw).sum(axis=2), np.float32(1e-10))
+        t    = np.clip(((pix - base) * d * aw).sum(axis=2) / lsq, 0, 1)
         indices = np.searchsorted(bounds, t.ravel()).reshape(k, 16).astype(np.uint8)
 
         # Anchor handling: suppress MSB at each subset's anchor pixel
@@ -1430,6 +1452,34 @@ def _bc7_mode7(pixels, pca=0, best_pid=None, lite=False, nano=False):
 def _compress_bc7_s(blocks_rgba, pca=0, lite=False, nano=False, zero=False):
     """(n,16,4) uint8 → (n,16) uint8 BC7-encoded blocks."""
     pf = blocks_rgba.astype(np.float32)
+
+    if _DEBUG_RANDOM:
+        n     = pf.shape[0]
+        mode  = np.random.randint(0, 8, n)
+        has_alpha = (pf[:, :, 3] < 255).any(axis=1)
+        mode = np.where(has_alpha & np.isin(mode, [0, 1, 2, 3]), 7, mode)
+        pid   = np.random.randint(0, 64, n).astype(np.uint8)
+        pid3s = np.random.randint(0, 16, n).astype(np.uint8)
+        pid3b = np.random.randint(0, 64, n).astype(np.uint8)
+        result = np.zeros((n, 16), np.uint8)
+        for m, fn, kw in [
+            (6, _bc7_mode6,          dict(pca=pca)),
+            (5, _bc7_mode5,          dict(pca=pca)),
+            (7, _bc7_mode7,          dict(pca=pca, best_pid=pid)),
+            (1, _bc7_encode_2subset, dict(mode=1, pca=pca, best_pid=pid)),
+            (3, _bc7_encode_2subset, dict(mode=3, pca=pca, best_pid=pid)),
+            (0, _bc7_encode_3subset, dict(mode=0, pca=pca, best_pid=pid3s)),
+            (2, _bc7_encode_3subset, dict(mode=2, pca=pca, best_pid=pid3b)),
+        ]:
+            sel = mode == m
+            if sel.any(): result[sel] = fn(pf[sel], **{k: v[sel] if isinstance(v, np.ndarray) else v for k, v in kw.items()})[0]
+        sel4 = mode == 4
+        if sel4.any():
+            half = sel4.sum() // 2
+            idx4 = np.where(sel4)[0]
+            result[idx4[:half]]  = _bc7_mode4_0(pf[idx4[:half]], pca)[0]
+            result[idx4[half:]]  = _bc7_mode4_1(pf[idx4[half:]], pca)[0]
+        return result
 
     best_blk, best_err = _bc7_mode6(pf, pca)
 
