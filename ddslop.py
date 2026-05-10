@@ -102,7 +102,7 @@ def einsum_ij(a, b):
 def np_mean(a, **kwargs):
     return np.mean(a, **kwargs)
 
-def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4):
+def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4, no_inset=False):
     """PCA endpoint selection via power iteration.
     pixels: (n, 16, C) float32 → e0, e1: (n, C) float32."""
     C = pixels.shape[2]
@@ -159,8 +159,9 @@ def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4):
     
     cx = indexes - 1.0
     # Outlier inset: move endpoints towards the mean (1D squish)
-    t0 -= t0 / cx / 4.0 * ratio
-    t1 -= t1 / cx / 4.0 * ratio
+    if not no_inset:
+        t0 -= t0 / cx / 4.0 * ratio
+        t1 -= t1 / cx / 4.0 * ratio
     
     t0_orig = t0
     t1_orig = t1
@@ -207,7 +208,8 @@ def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4):
         min_scale = np.min(scales, axis=-1, keepdims=True)
         return mean_color + d * np.clip(min_scale, 0.0, 1.0)
 
-    return clip_to_ray(e0), clip_to_ray(e1)
+    #return clip_to_ray(e0), clip_to_ray(e1)
+    return (e0), (e1)
 
 from multiprocessing.pool import ThreadPool
 
@@ -1343,7 +1345,7 @@ def _bc7_mode7(pixels, pca=0, best_pid=None, lite=False, nano=False):
 
         for m in (m0, m1):
             sub = pix[:, m, :]   # (k, count, 4)
-            ehi, elo = _pca_endpoints(sub, iterations=max(pca, 1), indexes=max_idx + 1)
+            ehi, elo = _pca_endpoints(sub, iterations=max(pca, 1), indexes=max_idx + 1, gd_iters=0, no_inset=True)
 
             c0, pb0 = _quant_ep_rgba(ehi)
             c1, pb1 = _quant_ep_rgba(elo)
@@ -1458,9 +1460,10 @@ def _compress_bc7_s(blocks_rgba, pca=0, lite=False, nano=False, zero=False):
     best_blk[better] = blk3[better]; best_err[better] = err3[better]
 
     blk7, err7 = _bc7_mode7(pf, pca=pca, best_pid=pid, lite=lite, nano=nano)
-    better = err7 < best_err
+    better = err7 < best_err * 1e30
     best_blk[better] = blk7[better]; best_err[better] = err7[better]
-
+    return best_blk
+    
     if nano: return best_blk
 
     # 3-subset modes (0 and 2) — RGB only, alpha forced to 255 in error metric
