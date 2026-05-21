@@ -52,7 +52,7 @@ _ERROR_DIFFUSION: bool = False
 
 # When True, _compress_bc7_s picks a mode uniformly at random per block instead
 # of by lowest error.  Useful for exercising every decoder path.
-_DEBUG_RANDOM: bool = True
+_DEBUG_RANDOM: bool = False
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1559,9 +1559,15 @@ def _compress_bc7(blocks_rgba, pca=0, lite=False, nano=False, zero=False, num_th
         [zero] * len(chunks)
     )
     # Process chunks in parallel
-    from concurrent.futures import ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=num_threads) as executor:
-        results = list(executor.map(_worker_unpack, zipped_args))
+    import sys
+    if hasattr(sys, "_is_gil_enabled") and sys._is_gil_enabled():
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=num_threads) as executor:
+            results = list(executor.map(_worker_unpack, zipped_args))
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            results = list(executor.map(_worker_unpack, zipped_args))
         
     # Recombine the encoded block chunks along the batch dimension (axis=0)
     return np.concatenate(results, axis=0)

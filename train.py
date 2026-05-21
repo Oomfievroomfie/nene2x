@@ -184,15 +184,14 @@ class UpscaleDataset:
 
 # ── saving ────────────────────────────────────────────────────────────────────
 
+
 def trysave(model, out_path):
-    import os, time
+    import time
     from safetensors.numpy import save_file as sf_save_numpy
-    tmp = str(out_path) + ".tmp"
     tensors_np = {k: v.numpy() for k, v in get_state_dict(model).items()}
     for attempt in range(3):
         try:
-            sf_save_numpy(tensors_np, tmp)
-            os.replace(tmp, str(out_path))
+            sf_save_numpy(tensors_np, str(out_path))
             return
         except Exception as e:
             print(e)
@@ -271,10 +270,24 @@ def train(args: argparse.Namespace):
 
     start_epoch = 1
     if args.resume and Path(args.resume).exists():
-        state = safe_load(args.resume)
+        import shutil
+        import tempfile
+        import os
+        
+        fd, temp_path = tempfile.mkstemp(suffix=".safetensors")
+        os.close(fd)
+        shutil.copy(args.resume, temp_path)
+        
+        state = safe_load(temp_path)
         net.load_weights(state)
+        
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+            
         print(f"Resumed weights from {args.resume}")
-
+    
     params = list(get_state_dict(net).values())
     total_params = sum(p.numpy().size for p in params)
     print(f"Parameters: {total_params:,}")

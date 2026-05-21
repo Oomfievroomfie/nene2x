@@ -27,7 +27,11 @@ Global prefix "b," (before the first token) marks a *bilinear-base* model.
   Example: "b,3x3_12,1x1_12,3x3_24,1x1_4"
 """
 
-gConfig = "b,3x3_12,3x3_12,3x3_4"
+gConfig = "3x3_8,1x1_4,3x3_10,3x3_6,1x1_4n"
+#gConfig = "b,3x3_4,3x3_11,1x1_11d,1x1_4n"
+#gConfig = "b,3x3_4,3x3_9,1x1_9,1x1_4"
+#gConfig = "3x3_4,3x3_9,1x1_9,1x1_4"
+#gConfig = "b,3x3_12,1x1_8,1x1_4"
 LEAKY_SLOPE = 0.00005
 
 

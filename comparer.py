@@ -81,6 +81,7 @@ def run_comparison(gt_path, est_path, args):
     mae_val = mae_func(gt_arr, est_arr, data_range=255)
     
     # --- AED Calculation ---
+    # (Adjusted Elevation Difference)
     # 1. Fully average the two images (per RGB channel)
     gt_rgb_avg = np.mean(gt_arr * (1.0/255.0), axis=(0, 1)) 
     est_rgb_avg = np.mean(est_arr * (1.0/255.0), axis=(0, 1))
@@ -116,7 +117,7 @@ def run_comparison(gt_path, est_path, args):
     print(f"B-VOI:       {bvoi_total:7.4f}  (Better: Lower)")
     if lpips_val is not None:
         print(f"LPIPS (Alex):{lpips_val:7.4f}  (Better: Lower)")
-    print(f"AED:         {aed_val:7.4f}  (Better: Closer to Zero)")
+    print(f"AED:         {aed_val:7.4f}  (Better: Lower)")
     print("-" * 50)
 
 if __name__ == "__main__":
