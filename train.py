@@ -16,7 +16,7 @@ from tinygrad.nn.optim import AdamW
 from tinygrad.nn.state import get_state_dict, safe_save, safe_load
 
 from model import (UpscaleNet, gaussian_blur,
-                   manual_downscale2x, upscale_edi_2x, upsample2x)
+                   manual_downscale2x, upscale_edi_2x, upsample2x, box_blur5x5_np)
 
 
 # ── loss helpers ──────────────────────────────────────────────────────────────
@@ -26,12 +26,6 @@ def loss_l1(pred: Tensor, target: Tensor) -> Tensor:
 
 def loss_mse(pred: Tensor, target: Tensor) -> Tensor:
     return ((pred - target) ** 2).mean()
-
-def loss_gradient(pred: Tensor, target: Tensor) -> Tensor:
-    d = pred - target
-    loss_x = (d[:, :, :, 1:] - d[:, :, :, :-1]).abs().mean()
-    loss_y = (d[:, :, 1:, :] - d[:, :, :-1, :]).abs().mean()
-    return loss_x + loss_y
 
 def loss_lE(pred: Tensor, target: Tensor) -> Tensor:
     residual = pred - target
@@ -301,7 +295,20 @@ def train(args: argparse.Namespace):
 
     trysave(net, out_path)
 
-    baseline_fn = upsample2x if net.is_bilinear else upscale_edi_2x
+    if net.is_raw:
+        def baseline_fn(t):
+            arr = t.numpy() if isinstance(t, Tensor) else t
+            C, H, W = arr.shape
+            return np.zeros((C, H * 2, W * 2), dtype=np.float32)
+    elif net.is_blurbilinear:
+        def baseline_fn(t):
+            arr = t.numpy() if isinstance(t, Tensor) else t
+            blurred = box_blur5x5_np(arr[np.newaxis], is_wrapping=False)[0]
+            return upsample2x(blurred, is_wrapping=False)
+    elif net.is_bilinear:
+        baseline_fn = upsample2x
+    else:
+        baseline_fn = upscale_edi_2x
     dataset = UpscaleDataset(
         args.data,
         patch_size=args.patch_size,

@@ -1,6 +1,5 @@
 # Entirely vibecoded implementation of FSR1.x
 # Higher quality than AMD's official FidelityFX CLI tool for some reason.
-# AMD's tool doesn't support adjusting sharpness in FSR+Scale mode.
 
 # official CLI
 # $ uv run python comparer.py test/marona_orig.png test/marona_half_2xfsrcli.png --lpips
@@ -146,12 +145,14 @@ def process_image(input_filepath, sharpness):
 
         vec4 colors[12];
         float lumas[12];
-        vec3 luma_w = vec3(0.299, 0.587, 0.114);
 
         for (int i = 0; i < 12; i++) {
             ivec2 p = clamp(base_pos + tap_offsets[i], ivec2(0), max_dim);
             colors[i] = imageLoad(img_in, p);
-            lumas[i] = dot(colors[i].rgb, luma_w);
+            // AMD upstream uses simplified unnormalized luma: 0.5*R + G + 0.5*B
+            // (same formula used in FsrEasuF: bczzL=bczzB*0.5+(bczzR*0.5+bczzG))
+            // NOT the standard BT.601 dot product.
+            lumas[i] = 0.5 * colors[i].r + colors[i].g + 0.5 * colors[i].b;
         }
 
         float wx = fract_pos.x;
@@ -207,9 +208,16 @@ def process_image(input_filepath, sharpness):
 
         vec4 final_color;
         if (abs(weight_accum) > 0.000001) {
-            final_color = color_accum / weight_accum;
+            vec4 raw = color_accum / weight_accum;
+            // AMD upstream dering: clamp result to the min/max of the nearest 2x2
+            // input texels (f, g, j, k). Without this the negative Lanczos lobes
+            // freely ring — this was the primary source of ringing artifacts.
+            // Matches: pix=min(max4,max(min4,aC*rcp(aW))) in FsrEasuF.
+            vec3 min4 = min(min(colors[3].rgb, colors[4].rgb), min(colors[7].rgb, colors[8].rgb));
+            vec3 max4 = max(max(colors[3].rgb, colors[4].rgb), max(colors[7].rgb, colors[8].rgb));
+            final_color = vec4(clamp(raw.rgb, min4, max4), raw.a);
         } else {
-            final_color = colors[3]; 
+            final_color = colors[3];
         }
 
         imageStore(img_out, out_pos, final_color);
@@ -222,47 +230,79 @@ def process_image(input_filepath, sharpness):
     fsr1_rcas_source = """
     #version 430
     layout(local_size_x = 16, local_size_y = 16) in;
-    
+
     layout(rgba32f, binding = 0) uniform readonly image2D img_in;
-    layout(rgba8, binding = 1) uniform writeonly image2D img_out;
-    
+    layout(rgba8,   binding = 1) uniform writeonly image2D img_out;
+
     uniform float sharpness;
-    
+
     void main() {
         ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
         ivec2 dim = imageSize(img_out);
         if (pos.x >= dim.x || pos.y >= dim.y) return;
-        
-        vec4 original_pixel = imageLoad(img_in, pos);
-        
+
+        vec4 ep = imageLoad(img_in, pos);
+
         if (sharpness <= 0.0) {
-            imageStore(img_out, pos, vec4(clamp(original_pixel.rgb, 0.0, 1.0), original_pixel.a));
+            imageStore(img_out, pos, vec4(clamp(ep.rgb, 0.0, 1.0), ep.a));
             return;
         }
 
         ivec2 max_dim = dim - 1;
-        
-        vec3 c = original_pixel.rgb;
-        vec3 n = imageLoad(img_in, clamp(pos + ivec2(0, -1), ivec2(0), max_dim)).rgb;
-        vec3 s = imageLoad(img_in, clamp(pos + ivec2(0, 1), ivec2(0), max_dim)).rgb;
-        vec3 w = imageLoad(img_in, clamp(pos + ivec2(-1, 0), ivec2(0), max_dim)).rgb;
-        vec3 e = imageLoad(img_in, clamp(pos + ivec2(1, 0), ivec2(0), max_dim)).rgb;
 
-        vec3 min_c = min(min(n, s), min(w, e));
-        vec3 max_c = max(max(n, s), max(w, e));
-        
-        vec3 limitMin = min(min_c, c);
-        vec3 limitMax = max(max_c, c);
-        
-        vec3 limit = min(c - limitMin, limitMax - c);
-        vec3 peakC = 1.0 / (max_c - min_c + 0.0001);
-        
-        float max_lobe = sharpness * -0.25;
-        vec3 w3 = max_lobe * (limit * peakC);
-        
-        vec3 final_color = (c + (n + s + w + e) * w3) / (1.0 + 4.0 * w3);
-        
-        imageStore(img_out, pos, vec4(clamp(final_color, 0.0, 1.0), original_pixel.a));
+        // 5-tap cross. AMD names: b=north, d=west, e=center, f=east, h=south.
+        vec3 b = imageLoad(img_in, clamp(pos + ivec2( 0,-1), ivec2(0), max_dim)).rgb;
+        vec3 d = imageLoad(img_in, clamp(pos + ivec2(-1, 0), ivec2(0), max_dim)).rgb;
+        vec3 e = ep.rgb;
+        vec3 f = imageLoad(img_in, clamp(pos + ivec2( 1, 0), ivec2(0), max_dim)).rgb;
+        vec3 h = imageLoad(img_in, clamp(pos + ivec2( 0, 1), ivec2(0), max_dim)).rgb;
+
+        // Per-channel min/max of the 4 cross neighbors (no center), matching
+        // AMD's mn4R/mx4R from FsrRcasF. The lobe derivation below solves for
+        // the largest negative weight 'w' such that output = (w*(b+d+f+h)+e)
+        // /(4w+1) stays within [0,1], using 4x the neighbor min/max in place
+        // of the full tap sum for MSAA stability (per AMD comments).
+        vec3 mn4 = min(min(b, d), min(f, h));
+        vec3 mx4 = max(max(b, d), max(f, h));
+
+        // peakC = vec2(1.0, -4.0) in AMD source.
+        // hitMin = min(mn4,e) / (4*mx4)          ← lobe that would clip at 0
+        // hitMax = (1 - max(mx4,e)) / (4*mn4 - 4) ← lobe that would clip at 1
+        // lobeC  = max(-hitMin, hitMax)            ← most conservative per channel
+        vec3 hitMin = min(mn4, e) / (4.0 * mx4 + 1e-5);
+        vec3 hitMax = (1.0 - max(mx4, e)) / (4.0 * mn4 - 4.0 - 1e-5);
+        vec3 lobeC  = max(-hitMin, hitMax);
+
+        // Take the least-negative per-channel lobe (max3), cap at 0 and
+        // -FSR_RCAS_LIMIT, then scale by user sharpness [0=none, 1=max].
+        // Using our [0,1] convention (0=none, 1=max) instead of AMD's stop-based
+        // FsrRcasCon which does exp2(-stops) — both produce the same [0,1] range.
+        const float FSR_RCAS_LIMIT = 0.25 - (1.0 / 16.0); // 0.1875
+        float lobe = max(-FSR_RCAS_LIMIT,
+                         min(max(lobeC.r, max(lobeC.g, lobeC.b)), 0.0))
+                     * sharpness;
+
+        // nz: noise suppression. Normalized highpass on luma detects grain/noise
+        // and reduces sharpening there. Completely absent from previous version.
+        // Luma uses same 0.5R+G+0.5B approximation as EASU.
+        float bL = 0.5 * b.r + b.g + 0.5 * b.b;
+        float dL = 0.5 * d.r + d.g + 0.5 * d.b;
+        float eL = 0.5 * e.r + e.g + 0.5 * e.b;
+        float fL = 0.5 * f.r + f.g + 0.5 * f.b;
+        float hL = 0.5 * h.r + h.g + 0.5 * h.b;
+
+        float nz = 0.25 * (bL + dL + fL + hL) - eL;
+        float lumaRange = max(max(bL, max(dL, eL)), max(fL, hL))
+                        - min(min(bL, min(dL, eL)), min(fL, hL));
+        nz = clamp(abs(nz) / (lumaRange + 1e-5), 0.0, 1.0);
+        nz = -0.5 * nz + 1.0;   // 1.0 on real edges, ~0.5 on pure noise
+        lobe *= nz;
+
+        // Resolve.
+        float rcpL = 1.0 / (4.0 * lobe + 1.0);
+        vec3 final_color = (lobe * (b + d + f + h) + e) * rcpL;
+
+        imageStore(img_out, pos, vec4(clamp(final_color, 0.0, 1.0), ep.a));
     }
     """
 

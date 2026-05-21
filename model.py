@@ -25,13 +25,27 @@ Global prefix "b," (before the first token) marks a *bilinear-base* model.
   • Detected automatically on load: the final weight key is "zfinalb" instead
     of "zfinal".
   Example: "b,3x3_12,1x1_12,3x3_24,1x1_4"
+
+Global prefix "g," marks a *blurred-bilinear-base* model.
+  • 5x5 box blur (respects wrapping) applied to LR before bilinear upscale.
+  • Detected automatically on load: the final weight key is "zfinalg".
+  Example: "g,3x3_12,1x1_12,3x3_24,1x1_4"
 """
 
-gConfig = "3x3_8,1x1_4,3x3_10,3x3_6,1x1_4n"
+#gConfig = "3x3_8,1x1_4,3x3_10,3x3_6,1x1_4n"
+#gConfig = "g,3x3_32,3x3_48,3x3_48,1x1_4"
+#gConfig = "g,3x3_24,3x3_48,1x1_64,3x3_320d,1x1_32,3x3_24,1x1_4"
+#gConfig = "g,3x3_8,3x3_32d,1x1_12,3x3_12,3x3_4"
+#gConfig = "g,3x3_12,3x3_32,1x1_24,3x3_96d,1x1_12,3x3_12,1x1_4"
+#gConfig = "g,3x3_12,3x3_24,3x3_32,1x1_24,3x3_24,1x1_16,1x1_4"
+#gConfig = "g,3x3_12,3x3_24,3x3_48,1x1_64,3x3_320d,1x1_32,3x3_24,1x1_4"
+#gConfig = "3x3_32,3x3_96,3x3_192,1x1_128,3x3_96,3x3_64,1x1_4"
+#gConfig = "3x3_32,3x3_64,1x1_64,3x3_128,1x1_96,3x3_64,3x3_48,1x1_4"
 #gConfig = "b,3x3_4,3x3_11,1x1_11d,1x1_4n"
 #gConfig = "b,3x3_4,3x3_9,1x1_9,1x1_4"
 #gConfig = "3x3_4,3x3_9,1x1_9,1x1_4"
 #gConfig = "b,3x3_12,1x1_8,1x1_4"
+gConfig = "g,3x3_16,3x3_32,3x3_64,1x1_64,3x3_64,3x3_128,1x1_96,3x3_48,1x1_4"
 LEAKY_SLOPE = 0.00005
 
 
@@ -55,9 +69,18 @@ def rot90_tensor(x: Tensor, k: int) -> Tensor:
 # ── config parsing ────────────────────────────────────────────────────────────
 
 def _parse_config(cfg: str) -> tuple:
+    is_raw = cfg.startswith("x,")
+    if is_raw:
+        cfg = cfg[2:]
     is_bilinear = cfg.startswith("b,")
     if is_bilinear:
         cfg = cfg[2:]
+        is_raw = False
+    is_blurbilinear = cfg.startswith("g,")
+    if is_blurbilinear:
+        cfg = cfg[2:]
+        is_raw = False
+        is_bilinear = False
     specs = []
     for token in cfg.split(","):
         token = token.strip()
@@ -69,13 +92,15 @@ def _parse_config(cfg: str) -> tuple:
         k = int(kpart.split("x")[0])
         specs.append((k, int(c_str), "d" in flags, "n" in flags))
     assert specs[-1][1] == 4, f"Final layer must output 4 channels, got {specs[-1][1]}"
-    return specs, is_bilinear
+    return specs, is_bilinear, is_raw, is_blurbilinear
 
 
-def _config_to_str(specs: list, is_bilinear: bool = False) -> str:
+def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False) -> str:
     def _token(k, c, dw, nb):
         return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}"
     body = ",".join(_token(*s) for s in specs)
+    if is_blurbilinear:
+        return "g," + body
     return ("b," + body) if is_bilinear else body
 
 
@@ -123,15 +148,29 @@ class UpscaleNet:
     def __init__(self, is_wrapping: bool = False):
         self.padding_enabled = True
         self.is_wrapping = is_wrapping
-        specs, is_bilinear = _parse_config(gConfig)
+        specs, is_bilinear, is_raw, is_blurbilinear = _parse_config(gConfig)
         self.is_bilinear = is_bilinear
+        self.is_raw = is_raw
+        self.is_blurbilinear = is_blurbilinear
         self._build_layers(specs)
 
     @staticmethod
     def _config_from_state(state: dict) -> tuple:
+        is_raw = "zfinalx.weight" in state
         is_bilinear = "zfinalb.weight" in state
-        final_key = "zfinalb.weight" if is_bilinear else "zfinal.weight"
-        final_pfx = "zfinalb"        if is_bilinear else "zfinal"
+        is_blurbilinear = "zfinalg.weight" in state
+        final_key = "zfinal.weight"
+        final_pfx = "zfinal"
+        if is_bilinear:
+            final_key = "zfinalb.weight"
+            final_pfx = "zfinalb"
+        if is_blurbilinear:
+            final_key = "zfinalg.weight"
+            final_pfx = "zfinalg"
+            is_bilinear = False
+        if is_raw:
+            final_key = "zfinalx.weight"
+            final_pfx = "zfinalx"
         assert final_key in state, f"No '{final_key}' in state dict"
 
         keys = sorted(k for k in state if k.startswith("layers.") and k.endswith(".weight"))
@@ -147,7 +186,7 @@ class UpscaleNet:
         is_depthwise = (len(keys) > 0) and (w.shape[1] == 1)
         no_bias = (final_pfx + ".bias") not in state
         specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
-        return specs, is_bilinear
+        return specs, is_bilinear, is_raw, is_blurbilinear
 
     def _build_layers(self, specs: list):
         in_c = 1
@@ -158,21 +197,35 @@ class UpscaleNet:
                                       bias=not no_bias, is_wrapping=self.is_wrapping))
             in_c = out_c
         self.layers = convs[:-1]
-        final_attr = "zfinalb" if self.is_bilinear else "zfinal"
+        final_attr = "zfinal"
+        if self.is_bilinear:
+            final_attr = "zfinalb"
+        if self.is_blurbilinear:
+            final_attr = "zfinalg"
+        if self.is_raw:
+            final_attr = "zfinalx"
         setattr(self, final_attr, convs[-1])
-        for stale in ("zfinal", "zfinalb"):
+        for stale in ("zfinal", "zfinalb", "zfinalg", "zfinalx"):
             if stale != final_attr and hasattr(self, stale):
                 delattr(self, stale)
 
     def load_weights(self, state: dict, strict: bool = True):
-        specs, is_bilinear = self._config_from_state(state)
+        specs, is_bilinear, is_raw, is_blurbilinear = self._config_from_state(state)
         self.is_bilinear = is_bilinear
+        self.is_raw = is_raw
+        self.is_blurbilinear = is_blurbilinear
         self._build_layers(specs)
         tg_load_state_dict(self, state, strict=strict)
 
     @property
     def _final_layer(self) -> Conv2dManual:
-        return self.zfinalb if self.is_bilinear else self.zfinal
+        if self.is_bilinear:
+            return self.zfinalb
+        if self.is_blurbilinear:
+            return self.zfinalg
+        if self.is_raw:
+            return self.zfinalx
+        return self.zfinal
 
     def set_padding_enabled(self, enabled: bool):
         self.padding_enabled = enabled
@@ -193,11 +246,17 @@ class UpscaleNet:
     def upscale_channel(self, lr: Tensor) -> Tensor:
         x = lr.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
         x_np = x.numpy()
-        if self.is_bilinear:
+        if self.is_blurbilinear:
+            blurred = box_blur5x5_np(x_np, self.is_wrapping)
+            base_np = upsample2x_np(blurred, self.is_wrapping)
+        elif self.is_bilinear or self.is_raw:
             base_np = upsample2x_np(x_np, self.is_wrapping)
         else:
             base_np = upscale_edi_2x_np(x_np, self.is_wrapping)
         base = Tensor(base_np.astype(np.float32))
+        
+        if self.is_raw:
+            base *= 0.0
 
         residual = self._jit_call(x)
 
@@ -246,6 +305,35 @@ def manual_downscale2x(t):
         return Tensor(result)
     C, H, W = t.shape
     return t.reshape(C, H // 2, 2, W // 2, 2).mean(axis=(2, 4)).astype(np.float32)
+
+
+def box_blur5x5_np(t: np.ndarray, is_wrapping: bool = False) -> np.ndarray:
+    """5x5 box blur on (B, C, H, W) or (C, H, W) numpy float32. Respects wrapping."""
+    batched = t.ndim == 4
+    if not batched:
+        t = t[np.newaxis]
+    pad_mode = "wrap" if is_wrapping else "edge"
+    t_pad = np.pad(t, ((0,0),(0,0),(2,2),(2,2)), mode=pad_mode)
+    out = np.zeros_like(t, dtype=np.float32)
+    norm = 0.0
+    B, C, H, W = t.shape
+    #for dy in range(1, 4):
+    #    wy = 1.0 if dy == 2 else 0.5
+    #    for dx in range(1, 4):
+    #        wx = 1.0 if dx == 2 else 0.5
+    for dy in range(5):
+        #wy = 1.0 if dy == 2 else 0.7 if dy == 1 or dy == 3 else 0.2
+        #wy = 1.0 if dy == 2 else 1.0 if dy == 1 or dy == 3 else 0.5
+        wy = 1.0 if dy == 2 else 0.5 if dy == 1 or dy == 3 else 0.0
+        for dx in range(5):
+            #wx = 1.0 if dx == 2 else 0.7 if dx == 1 or dx == 3 else 0.2
+            #wx = 1.0 if dx == 2 else 1.0 if dx == 1 or dx == 3 else 0.5
+            wx = 1.0 if dx == 2 else 0.5 if dx == 1 or dx == 3 else 0.0
+            norm += wy*wx
+            out += t_pad[:, :, dy:dy+H, dx:dx+W] * wy*wx
+        
+    out *= (1.0 / norm)
+    return (out if batched else out[0]).astype(np.float32)
 
 
 def upsample2x_np(t: np.ndarray, is_wrapping: bool = False) -> np.ndarray:
