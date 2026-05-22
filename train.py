@@ -293,7 +293,7 @@ def train(args: argparse.Namespace):
     total_params = sum(p.numpy().size for p in params)
     print(f"Parameters: {total_params:,}")
 
-    pad = sum((conv._k - 1) // 2
+    pad = sum((conv._k - 1) // 2 * conv._dilation
               for conv in [*net.layers, net._final_layer]
               if conv._k > 1)
     print(f"Receptive field pad: {pad} LR px")

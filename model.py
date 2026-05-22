@@ -13,34 +13,31 @@ Outputs are the RESIDUAL above EDI or bilinear interpolation, not raw pixel valu
 
 Config string syntax
 ────────────────────
-Each comma-separated token is "KxK_C[d][n]":
+Each comma-separated token is "KxK_C[d][n][q]":
   KxK   – square kernel size
   C     – number of output channels
   d     – (optional suffix) depthwise convolution: each channel is convolved
            independently (groups=in_channels).  e.g. "3x3_8d"
   n     – (optional suffix) no bias parameters
+  q     – (optional suffix) dilated convolution (dilation = (k-1)//2 + 1)
 
 Global prefix "b," (before the first token) marks a *bilinear-base* model.
   • The base upscale uses plain bilinear filtering (upsample2x) instead of EDI.
-  • Detected automatically on load: the final weight key is "zfinalb" instead
-    of "zfinal".
+  • Detected automatically on load via "zzzgConfig_" tensor.
   Example: "b,3x3_12,1x1_12,3x3_24,1x1_4"
 
 Global prefix "g," marks a *blurred-bilinear-base* model.
   • 5x5 box blur (respects wrapping) applied to LR before bilinear upscale.
-  • Detected automatically on load: the final weight key is "zfinalg".
   Example: "g,3x3_12,1x1_12,3x3_24,1x1_4"
 
 Global prefix "x," marks a *raw* model..
   • Network predicts raw colors, not residuals from a base upscale.
   • Unstable and very hard to train.
   • Might be useful if your loss function is GAN-like.
-  • Detected automatically on load: the final weight key is "zfinalx".
   Example: "x,3x3_12,1x1_4"
 
 Global prefix "r," marks a *3-channel RGB* model.
   • The network takes all 3 RGB channels simultaneously instead of one at a time.
-  • Detected automatically on load: the first layer weight has shape[1] == 3.
   • Can be combined with other prefixes, e.g. "r,g,3x3_16,3x3_32,1x1_12"
   Example: "r,g,3x3_16,3x3_32,3x3_64,1x1_12"
 """
@@ -59,7 +56,7 @@ Global prefix "r," marks a *3-channel RGB* model.
 #gConfig = "3x3_4,3x3_9,1x1_9,1x1_4"
 #gConfig = "b,3x3_12,1x1_8,1x1_4"
 #gConfig = "r,b,3x3_12,3x3_24,3x3_48,1x1_24,1x1_12"
-gConfig = "r,3x3_20,3x3_20,3x3_20,3x3_32,1x1_20,1x1_12"
+gConfig = "r,3x3_20,3x3_20,3x3_32,1x1_20,1x1_12"
 #gConfig = "r,g,3x3_32,3x3_32,3x3_64,1x1_64,3x3_64,3x3_128,1x1_96,3x3_48,1x1_12"
 #gConfig = "r,g,3x3_32,3x3_32n,3x3_32n,3x3_32n,3x3_32n,3x3_32n,1x1_12n"
 LEAKY_SLOPE = 0.00005
@@ -104,20 +101,20 @@ def _parse_config(cfg: str) -> tuple:
     for token in cfg.split(","):
         token = token.strip()
         flags = set()
-        while token[-1] in ("d", "n"):
+        while token[-1] in ("d", "n", "q"):
             flags.add(token[-1])
             token = token[:-1]
         kpart, c_str = token.split("_")
         k = int(kpart.split("x")[0])
-        specs.append((k, int(c_str), "d" in flags, "n" in flags))
+        specs.append((k, int(c_str), "d" in flags, "n" in flags, "q" in flags))
     expected_out = 12 if is_3ch else 4
     assert specs[-1][1] == expected_out, f"Final layer must output {expected_out} channels, got {specs[-1][1]}"
     return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch
 
 
 def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False, is_3ch: bool = False) -> str:
-    def _token(k, c, dw, nb):
-        return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}"
+    def _token(k, c, dw, nb, dil=False):
+        return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}{'q' if dil else ''}"
     body = ",".join(_token(*s) for s in specs)
     if is_blurbilinear:
         body = "g," + body
@@ -134,9 +131,10 @@ class Conv2dManual:
     """Conv2d with manual replicate/circular padding. weight/bias exposed directly."""
 
     def __init__(self, in_c: int, out_c: int, k: int,
-                 groups: int = 1, bias: bool = True, is_wrapping: bool = False):
+                 groups: int = 1, bias: bool = True, is_wrapping: bool = False, dilation: int = 1):
         self._k = k
-        self._pad_size = (k - 1) // 2
+        self._dilation = dilation
+        self._pad_size = (k - 1) // 2 * dilation
         self.padding_enabled = True
         self.is_wrapping = is_wrapping
         self.groups = groups
@@ -163,7 +161,7 @@ class Conv2dManual:
             mode = "circular" if self.is_wrapping else "replicate"
             p = self._pad_size
             x = x.pad(((0, 0), (0, 0), (p, p), (p, p)), mode=mode)
-        return x.conv2d(self.weight, self.bias, groups=self.groups)
+        return x.conv2d(self.weight, self.bias, groups=self.groups, dilation=self._dilation)
 
 
 # ── model ─────────────────────────────────────────────────────────────────────
@@ -224,10 +222,13 @@ class UpscaleNet:
     def _build_layers(self, specs: list):
         in_c = 3 if self.is_3ch else 1
         convs = []
-        for k, out_c, is_depthwise, no_bias in specs:
+        for k, out_c, is_depthwise, no_bias, *rest in specs:
+            is_dilated = rest[0] if rest else False
             groups = in_c if is_depthwise else 1
+            dilation = 2 if is_dilated else 1
             convs.append(Conv2dManual(in_c, out_c, k, groups=groups,
-                                      bias=not no_bias, is_wrapping=self.is_wrapping))
+                                      bias=not no_bias, is_wrapping=self.is_wrapping,
+                                      dilation=dilation))
             in_c = out_c
         self.layers = convs[:-1]
         final_attr = "zfinal"
@@ -241,9 +242,21 @@ class UpscaleNet:
         for stale in ("zfinal", "zfinalb", "zfinalg", "zfinalx"):
             if stale != final_attr and hasattr(self, stale):
                 delattr(self, stale)
+        
+        cfg_str = _config_to_str(specs, self.is_bilinear, self.is_blurbilinear, self.is_3ch)
+        for stale in [k for k in self.__dict__ if k.startswith("zzzgConfig_")]:
+            delattr(self, stale)
+        self.zzzgConfig = cfg_str
+        
+        setattr(self, f"zzzgConfig_{self.zzzgConfig}", Tensor([0.0]))
 
     def load_weights(self, state: dict, strict: bool = True):
-        specs, is_bilinear, is_raw, is_blurbilinear, is_3ch = self._config_from_state(state)
+        cfg_key = next((k for k in state if k.startswith("zzzgConfig_")), None)
+        if cfg_key is not None:
+            cfg_str = cfg_key[len("zzzgConfig_"):]
+            specs, is_bilinear, is_raw, is_blurbilinear, is_3ch = _parse_config(cfg_str)
+        else:
+            specs, is_bilinear, is_raw, is_blurbilinear, is_3ch = self._config_from_state(state)
         self.is_bilinear = is_bilinear
         self.is_raw = is_raw
         self.is_blurbilinear = is_blurbilinear
