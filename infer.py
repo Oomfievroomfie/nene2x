@@ -199,7 +199,7 @@ def upscale_image(model: UpscaleNet,
 
     if yonly:
         ycgco = True
-    if ycgco:
+    if ycgco and not model.is_3ch:
         tensor = _rgb_to_ycgco(tensor)
     C, H, W = tensor.shape
 
@@ -208,66 +208,116 @@ def upscale_image(model: UpscaleNet,
 
     start = time.perf_counter()
 
-    if tile_size is None or tile_size <= 1:
-        # whole-image path
-        if pad > 0:
-            tensor_in = np.pad(tensor, ((0,0),(pad,pad),(pad,pad)), mode=pad_mode)
-        else:
-            tensor_in = tensor
-        channels = []
-        for c in range(C):
-            if yonly and c != 0:
-                channels.append(_bilinear_upsample_2x(tensor[c]))
+    if model.is_3ch:
+        # pass all 3 RGB planes together; alpha (if present) bilinear-upscaled separately
+        rgb3 = tensor[:3]
+        if tile_size is None or tile_size <= 1:
+            if pad > 0:
+                rgb_in = np.pad(rgb3, ((0,0),(pad,pad),(pad,pad)), mode=pad_mode)
             else:
-                ch_t = Tensor(tensor_in[c].astype(np.float32))
-                channels.append(model.upscale_channel(ch_t).numpy())
-        result = np.stack(channels, axis=0)  # (C, 2H, 2W)
-    else:
-        stride       = tile_size
-        out_H, out_W = H * 2, W * 2
-        off          = 1
-        result       = np.zeros((C, out_H + off, out_W + off), dtype=np.float32)
-
-        ph = pad + stride
-        total_h = H + ph + pad
-        total_w = W + ph + pad
-        if pad_mode == "wrap" and (ph >= H or pad >= W or stride >= W):
-            ys = np.arange(total_h) % H  # simplified
-            xs = np.arange(total_w) % W
-            tensor_pad = tensor[:, ys][:, :, xs]
+                rgb_in = rgb3
+            ch_t = Tensor(rgb_in.astype(np.float32))
+            result = model.upscale_channel(ch_t).numpy()  # (3, 2H, 2W)
         else:
-            tensor_pad = np.pad(tensor, ((0,0),(ph,pad),(ph,pad)), mode=pad_mode)
+            stride       = tile_size
+            out_H, out_W = H * 2, W * 2
+            off          = 1
+            result       = np.zeros((3, out_H + off, out_W + off), dtype=np.float32)
 
-        full_tile_h = stride + 2 * pad
-        full_tile_w = stride + 2 * pad
-        net_chans = [0] if yonly else list(range(C))
-        for y0 in range(0, H, stride):
-            y1 = min(y0 + stride, H)
-            for x0 in range(0, W, stride):
-                x1 = min(x0 + stride, W)
-                tile = tensor_pad[:, y0+stride : y1+stride+2*pad,
-                                     x0+stride : x1+stride+2*pad]
-                th, tw = tile.shape[1], tile.shape[2]
-                if th < full_tile_h or tw < full_tile_w:
-                    tile = np.pad(tile,
-                                  ((0,0),(0, full_tile_h-th),(0, full_tile_w-tw)),
-                                  mode="edge")
-                out_h, out_w = (y1 - y0) * 2, (x1 - x0) * 2
-                for c in net_chans:
-                    ch_t = Tensor(tile[c].astype(np.float32))
-                    result[c, y0*2+off : y1*2+off, x0*2+off : x1*2+off] = \
-                        model.upscale_channel(ch_t).numpy()[:out_h, :out_w]
+            ph = pad + stride
+            total_h = H + ph + pad
+            total_w = W + ph + pad
+            if pad_mode == "wrap" and (ph >= H or pad >= W or stride >= W):
+                ys = np.arange(total_h) % H
+                xs = np.arange(total_w) % W
+                tensor_pad = rgb3[:, ys][:, :, xs]
+            else:
+                tensor_pad = np.pad(rgb3, ((0,0),(ph,pad),(ph,pad)), mode=pad_mode)
 
-        result = result[:, off:off+out_H, off:off+out_W]
+            full_tile_h = stride + 2 * pad
+            full_tile_w = stride + 2 * pad
+            for y0 in range(0, H, stride):
+                y1 = min(y0 + stride, H)
+                for x0 in range(0, W, stride):
+                    x1 = min(x0 + stride, W)
+                    tile = tensor_pad[:, y0+stride : y1+stride+2*pad,
+                                         x0+stride : x1+stride+2*pad]
+                    th, tw = tile.shape[1], tile.shape[2]
+                    if th < full_tile_h or tw < full_tile_w:
+                        tile = np.pad(tile,
+                                      ((0,0),(0, full_tile_h-th),(0, full_tile_w-tw)),
+                                      mode="edge")
+                    out_h, out_w = (y1 - y0) * 2, (x1 - x0) * 2
+                    ch_t = Tensor(tile.astype(np.float32))
+                    result[:, y0*2+off : y1*2+off, x0*2+off : x1*2+off] = \
+                        model.upscale_channel(ch_t).numpy()[:, :out_h, :out_w]
 
-        if yonly:
-            for c in range(1, C):
-                result[c] = _bilinear_upsample_2x(tensor[c])
+            result = result[:, off:off+out_H, off:off+out_W]
+
+        if C == 4:
+            alpha_up = _bilinear_upsample_2x(tensor[3])
+            result = np.concatenate([result, alpha_up[np.newaxis]], axis=0)
+    else:
+        if tile_size is None or tile_size <= 1:
+            # whole-image path
+            if pad > 0:
+                tensor_in = np.pad(tensor, ((0,0),(pad,pad),(pad,pad)), mode=pad_mode)
+            else:
+                tensor_in = tensor
+            channels = []
+            for c in range(C):
+                if yonly and c != 0:
+                    channels.append(_bilinear_upsample_2x(tensor[c]))
+                else:
+                    ch_t = Tensor(tensor_in[c].astype(np.float32))
+                    channels.append(model.upscale_channel(ch_t).numpy())
+            result = np.stack(channels, axis=0)  # (C, 2H, 2W)
+        else:
+            stride       = tile_size
+            out_H, out_W = H * 2, W * 2
+            off          = 1
+            result       = np.zeros((C, out_H + off, out_W + off), dtype=np.float32)
+
+            ph = pad + stride
+            total_h = H + ph + pad
+            total_w = W + ph + pad
+            if pad_mode == "wrap" and (ph >= H or pad >= W or stride >= W):
+                ys = np.arange(total_h) % H  # simplified
+                xs = np.arange(total_w) % W
+                tensor_pad = tensor[:, ys][:, :, xs]
+            else:
+                tensor_pad = np.pad(tensor, ((0,0),(ph,pad),(ph,pad)), mode=pad_mode)
+
+            full_tile_h = stride + 2 * pad
+            full_tile_w = stride + 2 * pad
+            net_chans = [0] if yonly else list(range(C))
+            for y0 in range(0, H, stride):
+                y1 = min(y0 + stride, H)
+                for x0 in range(0, W, stride):
+                    x1 = min(x0 + stride, W)
+                    tile = tensor_pad[:, y0+stride : y1+stride+2*pad,
+                                         x0+stride : x1+stride+2*pad]
+                    th, tw = tile.shape[1], tile.shape[2]
+                    if th < full_tile_h or tw < full_tile_w:
+                        tile = np.pad(tile,
+                                      ((0,0),(0, full_tile_h-th),(0, full_tile_w-tw)),
+                                      mode="edge")
+                    out_h, out_w = (y1 - y0) * 2, (x1 - x0) * 2
+                    for c in net_chans:
+                        ch_t = Tensor(tile[c].astype(np.float32))
+                        result[c, y0*2+off : y1*2+off, x0*2+off : x1*2+off] = \
+                            model.upscale_channel(ch_t).numpy()[:out_h, :out_w]
+
+            result = result[:, off:off+out_H, off:off+out_W]
+
+            if yonly:
+                for c in range(1, C):
+                    result[c] = _bilinear_upsample_2x(tensor[c])
 
     end = time.perf_counter()
     timesum += end - start
 
-    if ycgco:
+    if ycgco and not model.is_3ch:
         result = _ycgco_to_rgb(result)
     return _to_pil(result, mode)
 

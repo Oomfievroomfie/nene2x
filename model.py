@@ -13,7 +13,7 @@ Outputs are the RESIDUAL above EDI or bilinear interpolation, not raw pixel valu
 
 Config string syntax
 ────────────────────
-Each comma-separated token is "KxK_C[d]":
+Each comma-separated token is "KxK_C[d][n]":
   KxK   – square kernel size
   C     – number of output channels
   d     – (optional suffix) depthwise convolution: each channel is convolved
@@ -30,6 +30,19 @@ Global prefix "g," marks a *blurred-bilinear-base* model.
   • 5x5 box blur (respects wrapping) applied to LR before bilinear upscale.
   • Detected automatically on load: the final weight key is "zfinalg".
   Example: "g,3x3_12,1x1_12,3x3_24,1x1_4"
+
+Global prefix "x," marks a *raw* model..
+  • Network predicts raw colors, not residuals from a base upscale.
+  • Unstable and very hard to train.
+  • Might be useful if your loss function is GAN-like.
+  • Detected automatically on load: the final weight key is "zfinalx".
+  Example: "x,3x3_12,1x1_4"
+
+Global prefix "r," marks a *3-channel RGB* model.
+  • The network takes all 3 RGB channels simultaneously instead of one at a time.
+  • Detected automatically on load: the first layer weight has shape[1] == 3.
+  • Can be combined with other prefixes, e.g. "r,g,3x3_16,3x3_32,1x1_12"
+  Example: "r,g,3x3_16,3x3_32,3x3_64,1x1_12"
 """
 
 #gConfig = "3x3_8,1x1_4,3x3_10,3x3_6,1x1_4n"
@@ -45,7 +58,10 @@ Global prefix "g," marks a *blurred-bilinear-base* model.
 #gConfig = "b,3x3_4,3x3_9,1x1_9,1x1_4"
 #gConfig = "3x3_4,3x3_9,1x1_9,1x1_4"
 #gConfig = "b,3x3_12,1x1_8,1x1_4"
-gConfig = "g,3x3_16,3x3_32,3x3_64,1x1_64,3x3_64,3x3_128,1x1_96,3x3_48,1x1_4"
+#gConfig = "r,b,3x3_12,3x3_24,3x3_48,1x1_24,1x1_12"
+gConfig = "r,3x3_20,3x3_20,3x3_20,3x3_32,1x1_20,1x1_12"
+#gConfig = "r,g,3x3_32,3x3_32,3x3_64,1x1_64,3x3_64,3x3_128,1x1_96,3x3_48,1x1_12"
+#gConfig = "r,g,3x3_32,3x3_32n,3x3_32n,3x3_32n,3x3_32n,3x3_32n,1x1_12n"
 LEAKY_SLOPE = 0.00005
 
 
@@ -69,6 +85,9 @@ def rot90_tensor(x: Tensor, k: int) -> Tensor:
 # ── config parsing ────────────────────────────────────────────────────────────
 
 def _parse_config(cfg: str) -> tuple:
+    is_3ch = cfg.startswith("r,")
+    if is_3ch:
+        cfg = cfg[2:]
     is_raw = cfg.startswith("x,")
     if is_raw:
         cfg = cfg[2:]
@@ -91,17 +110,22 @@ def _parse_config(cfg: str) -> tuple:
         kpart, c_str = token.split("_")
         k = int(kpart.split("x")[0])
         specs.append((k, int(c_str), "d" in flags, "n" in flags))
-    assert specs[-1][1] == 4, f"Final layer must output 4 channels, got {specs[-1][1]}"
-    return specs, is_bilinear, is_raw, is_blurbilinear
+    expected_out = 12 if is_3ch else 4
+    assert specs[-1][1] == expected_out, f"Final layer must output {expected_out} channels, got {specs[-1][1]}"
+    return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch
 
 
-def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False) -> str:
+def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False, is_3ch: bool = False) -> str:
     def _token(k, c, dw, nb):
         return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}"
     body = ",".join(_token(*s) for s in specs)
     if is_blurbilinear:
-        return "g," + body
-    return ("b," + body) if is_bilinear else body
+        body = "g," + body
+    elif is_bilinear:
+        body = "b," + body
+    if is_3ch:
+        body = "r," + body
+    return body
 
 
 # ── Conv2d wrapper with manual padding ────────────────────────────────────────
@@ -148,10 +172,11 @@ class UpscaleNet:
     def __init__(self, is_wrapping: bool = False):
         self.padding_enabled = True
         self.is_wrapping = is_wrapping
-        specs, is_bilinear, is_raw, is_blurbilinear = _parse_config(gConfig)
+        specs, is_bilinear, is_raw, is_blurbilinear, is_3ch = _parse_config(gConfig)
         self.is_bilinear = is_bilinear
         self.is_raw = is_raw
         self.is_blurbilinear = is_blurbilinear
+        self.is_3ch = is_3ch
         self._build_layers(specs)
 
     @staticmethod
@@ -175,21 +200,29 @@ class UpscaleNet:
 
         keys = sorted(k for k in state if k.startswith("layers.") and k.endswith(".weight"))
         specs = []
+        first_in_c = None
         for i, k in enumerate(keys):
             w = state[k]
             pfx = k[:-len(".weight")]
-            is_depthwise = (i > 0) and (w.shape[1] == 1)
+            if i == 0:
+                first_in_c = w.shape[1]
+                is_depthwise = False
+            else:
+                is_depthwise = (w.shape[1] == 1)
             no_bias = (pfx + ".bias") not in state
             specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
 
         w = state[final_key]
+        if first_in_c is None:
+            first_in_c = w.shape[1]
         is_depthwise = (len(keys) > 0) and (w.shape[1] == 1)
         no_bias = (final_pfx + ".bias") not in state
         specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
-        return specs, is_bilinear, is_raw, is_blurbilinear
+        is_3ch = (first_in_c == 3)
+        return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch
 
     def _build_layers(self, specs: list):
-        in_c = 1
+        in_c = 3 if self.is_3ch else 1
         convs = []
         for k, out_c, is_depthwise, no_bias in specs:
             groups = in_c if is_depthwise else 1
@@ -210,10 +243,11 @@ class UpscaleNet:
                 delattr(self, stale)
 
     def load_weights(self, state: dict, strict: bool = True):
-        specs, is_bilinear, is_raw, is_blurbilinear = self._config_from_state(state)
+        specs, is_bilinear, is_raw, is_blurbilinear, is_3ch = self._config_from_state(state)
         self.is_bilinear = is_bilinear
         self.is_raw = is_raw
         self.is_blurbilinear = is_blurbilinear
+        self.is_3ch = is_3ch
         self._build_layers(specs)
         tg_load_state_dict(self, state, strict=strict)
 
@@ -244,7 +278,11 @@ class UpscaleNet:
         return self.__call__(x)
 
     def upscale_channel(self, lr: Tensor) -> Tensor:
-        x = lr.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        """lr: (H,W) for 1-channel models, or (3,H,W) for 3-channel models."""
+        if self.is_3ch:
+            x = lr.unsqueeze(0)  # (1,3,H,W)
+        else:
+            x = lr.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
         x_np = x.numpy()
         if self.is_blurbilinear:
             blurred = box_blur5x5_np(x_np, self.is_wrapping)
@@ -254,7 +292,7 @@ class UpscaleNet:
         else:
             base_np = upscale_edi_2x_np(x_np, self.is_wrapping)
         base = Tensor(base_np.astype(np.float32))
-        
+
         if self.is_raw:
             base *= 0.0
 
@@ -266,6 +304,9 @@ class UpscaleNet:
             dH, dW = (bH - rH) // 2, (bW - rW) // 2
             base = base[:, :, dH:dH+rH, dW:dW+rW]
 
+        if self.is_3ch:
+            # returns (3, 2H, 2W)
+            return (base + residual).squeeze(0).clamp(0.0, 1.0)
         return (base + residual).squeeze(0).squeeze(0).clamp(0.0, 1.0)
 
 

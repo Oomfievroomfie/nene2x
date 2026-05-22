@@ -27,10 +27,9 @@ def loss_l1(pred: Tensor, target: Tensor) -> Tensor:
 def loss_mse(pred: Tensor, target: Tensor) -> Tensor:
     return ((pred - target) ** 2).mean()
 
-def loss_lE(pred: Tensor, target: Tensor) -> Tensor:
+def loss_lE(pred: Tensor, target: Tensor, z: Tensor) -> Tensor:
     residual = pred - target
     abs_residual = residual.abs()
-    z = Tensor.randn(*pred.shape)
     noisy_target = target + abs_residual * z
     return (pred - noisy_target).abs().mean()
 
@@ -87,12 +86,14 @@ class UpscaleDataset:
         precompute_factor: int = 1,
         pad: int = 0,
         baseline_fn=None,
+        is_3ch: bool = False,
     ):
         self.patch_size       = patch_size
         self.patches_per_pair = patches_per_pair
         self.precompute_factor = precompute_factor
         self.pad              = pad
         self.baseline_fn = baseline_fn if baseline_fn is not None else upscale_edi_2x
+        self.is_3ch = is_3ch
 
         self.pairs: list[tuple[np.ndarray, np.ndarray]] = []
         self._load(Path(folder), n_aug, brightness_range)
@@ -109,6 +110,10 @@ class UpscaleDataset:
         for p in tqdm(paths, desc="Preprocessing images"):
             try:
                 hr = _load_as_float(p)
+                if self.is_3ch:
+                    if hr.shape[0] < 3:
+                        continue  # skip grayscale images for 3-channel models
+                    hr = hr[:3]
                 self._add_image(hr, n_aug, brightness_range)
             except Exception as e:
                 print(f"  skip {p.name}: {e}")
@@ -172,6 +177,8 @@ class UpscaleDataset:
             lr       = lr      [:, ly : ly + ph,       lx : lx + ph      ]
             residual = residual[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
 
+        if self.is_3ch:
+            return lr, residual  # (3, H, W) and (3, 2H, 2W)
         c = random.randrange(C)
         return lr[c:c+1], residual[c:c+1]
 
@@ -219,8 +226,8 @@ def run_validation(model, val_dataset, device_str) -> float:
             lr_patch  = lr
             res_patch = residual
 
-        lr_in  = Tensor(lr_patch[:, np.newaxis])    # (C, 1, H, W)
-        res_in = Tensor(res_patch[:, np.newaxis])
+        lr_in  = Tensor(lr_patch[np.newaxis])    # (1, C, H, W)
+        res_in = Tensor(res_patch[np.newaxis])
 
         pred = model(lr_in)
         pl = (loss_l1(pred, res_in) + loss_mse(pred, res_in)).numpy().item()
@@ -318,6 +325,7 @@ def train(args: argparse.Namespace):
         precompute_factor=args.precompute_factor,
         pad=pad,
         baseline_fn=baseline_fn,
+        is_3ch=net.is_3ch,
     )
 
     print(f"Dataset: {len(dataset.pairs)} precomputed pairs")
@@ -332,6 +340,7 @@ def train(args: argparse.Namespace):
         precompute_factor=1,
         pad=pad,
         baseline_fn=baseline_fn,
+        is_3ch=net.is_3ch,
     )
     print(f"Validation set: {len(val_dataset.pairs)} pairs")
 
@@ -340,13 +349,14 @@ def train(args: argparse.Namespace):
 
     use_basic_loss = args.basic_loss
     @TinyJit
-    def train_step(lr_batch: Tensor, res_batch: Tensor) -> Tensor:
+    def train_step(lr_batch: Tensor, res_batch: Tensor, z: Tensor) -> Tensor:
         opt.zero_grad()
         pred = net(lr_batch)
         if use_basic_loss:
             loss = loss_l1(pred, res_batch) + loss_mse(pred, res_batch)
         else:
-            loss = loss_lE(pred, res_batch)
+            loss = loss_lE(pred, res_batch, z)
+            #loss += (loss_l1(pred, res_batch) + loss_mse(pred, res_batch)) * 0.05
         loss.backward()
         clip_grad_norm_(params, max_norm=1.0)
         opt.step()
@@ -387,8 +397,9 @@ def train(args: argparse.Namespace):
 
             lr_batch  = Tensor(np.stack(lr_list,  axis=0).astype(np.float32))
             res_batch = Tensor(np.stack(res_list, axis=0).astype(np.float32))
+            z_batch   = Tensor(np.random.randn(*res_batch.shape).astype(np.float32))
 
-            loss = train_step(lr_batch, res_batch)
+            loss = train_step(lr_batch, res_batch, z_batch)
             running_loss += loss.numpy().item()
             steps += 1
 
