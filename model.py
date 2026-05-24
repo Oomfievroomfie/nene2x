@@ -19,7 +19,7 @@ Each comma-separated token is "KxK_C[d][n][q]":
   d     – (optional suffix) depthwise convolution: each channel is convolved
            independently (groups=in_channels).  e.g. "3x3_8d"
   n     – (optional suffix) no bias parameters
-  q     – (optional suffix) dilated convolution (dilation = (k-1)//2 + 1)
+  q     – (optional suffix) dilated convolution (dilation = 2)
 
 Global prefix "b," (before the first token) marks a *bilinear-base* model.
   • The base upscale uses plain bilinear filtering (upsample2x) instead of EDI.
@@ -56,10 +56,36 @@ Global prefix "r," marks a *3-channel RGB* model.
 #gConfig = "3x3_4,3x3_9,1x1_9,1x1_4"
 #gConfig = "b,3x3_12,1x1_8,1x1_4"
 #gConfig = "r,b,3x3_12,3x3_24,3x3_48,1x1_24,1x1_12"
-gConfig = "r,3x3_20,3x3_20,3x3_32,1x1_20,1x1_12"
-#gConfig = "r,g,3x3_32,3x3_32,3x3_64,1x1_64,3x3_64,3x3_128,1x1_96,3x3_48,1x1_12"
+#gConfig = "g,3x3_12,3x3_16q,3x3_16,3x3_16,1x1_4"
+#gConfig = "g,3x3_12,3x3_12q,3x3_32,1x1_24,3x3_96d,1x1_12,3x3_12,1x1_4"
+#gConfig = "g,3x3_12,3x3_12q,3x3_24,3x3_32,1x1_24,3x3_24,1x1_16,1x1_4"
+#gConfig = "g,3x3_12,3x3_12q,3x3_24,3x3_32,1x1_24,3x3_24,1x1_16,1x1_4"
+#gConfig = "g,3x3_24,3x3_32q,3x3_48,1x1_64,3x3_320d,1x1_24,3x3_24,1x1_4"
+#gConfig = "g,3x3_24,3x3_48,3x3_72,3x3_72,1x1_4"
+
+#gConfig = "g,3x3_12,3x3_24qd,3x3_24,3x3_24qd,3x3_32,3x3_48,1x1_4"
+
+#gConfig = "g,3x3_12,3x3_24,3x3_24,3x3_32,3x3_72,1x1_4"
+#gConfig = "g,3x3_12,3x3_24,3x3_24,3x3_32,3x3_72,1x1_24,1x1_4"
+#gConfig = "g,3x3_24,3x3_24qd,3x3_32,3x3_32,3x3_64,3x3_96,1x1_24,1x1_4"
+#gConfig = "g,3x3_24,3x3_24,3x3_32,3x3_32,3x3_64,3x3_96,1x1_24,1x1_4"
+#gConfig = "g,3x3_16,3x3_24,3x3_32q,3x3_32,3x3_32,1x1_4"
+#gConfig = "r,3x3_20,3x3_20,3x3_32,5x5_12"
+#gConfig = "g,3x3_32,3x3_32q,3x3_48,3x3_64,1x1_64,3x3_64,3x3_128,1x1_96,3x3_48,1x1_4"
 #gConfig = "r,g,3x3_32,3x3_32n,3x3_32n,3x3_32n,3x3_32n,3x3_32n,1x1_12n"
-LEAKY_SLOPE = 0.00005
+
+#gConfig = "g,3x3_24,3x3_32q,3x3_32,1x1_48,3x3_72,1x1_64,3x3_48,3x3_32,1x1_4"
+#gConfig = "3x3_12,3x3_12q,3x3_32,1x1_24,3x3_96d,1x1_12,3x3_12,1x1_4"
+#gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_32,1x1_4"
+#gConfig = "3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_32,1x1_4"
+#gConfig = "g,3x3_12,3x3_20q,3x3_24,3x3_28,3x3_56,1x1_4"
+#gConfig = "g,3x3_16,3x3_24q,3x3_96d,1x1_24,3x3_28,3x3_52,3x3_4"
+#gConfig = "g,3x3_16,3x3_24q,3x3_96d,1x1_24,3x3_32,3x3_56,1x1_4"
+#gConfig = "g,3x3_16,3x3_48q,3x3_96d,1x1_38,3x3_38,3x3_56,3x3_96,1x1_4"
+#gConfig = "g,3x3_32,3x3_48q,3x3_96d,1x1_38,3x3_38,3x3_56,3x3_96,1x1_4"
+gConfig = "g,3x3_32,3x3_40q,3x3_48,3x3_96,3x3_40,1x1_4"
+
+LEAKY_SLOPE = 0.00004
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -112,7 +138,7 @@ def _parse_config(cfg: str) -> tuple:
     return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch
 
 
-def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False, is_3ch: bool = False) -> str:
+def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False, is_raw: bool = False, is_3ch: bool = False) -> str:
     def _token(k, c, dw, nb, dil=False):
         return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}{'q' if dil else ''}"
     body = ",".join(_token(*s) for s in specs)
@@ -120,6 +146,8 @@ def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool
         body = "g," + body
     elif is_bilinear:
         body = "b," + body
+    elif is_raw:
+        body = "x," + body
     if is_3ch:
         body = "r," + body
     return body
@@ -194,6 +222,8 @@ class UpscaleNet:
         if is_raw:
             final_key = "zfinalx.weight"
             final_pfx = "zfinalx"
+            is_bilinear = False
+            is_blurbilinear = False
         assert final_key in state, f"No '{final_key}' in state dict"
 
         keys = sorted(k for k in state if k.startswith("layers.") and k.endswith(".weight"))
@@ -243,12 +273,21 @@ class UpscaleNet:
             if stale != final_attr and hasattr(self, stale):
                 delattr(self, stale)
         
-        cfg_str = _config_to_str(specs, self.is_bilinear, self.is_blurbilinear, self.is_3ch)
+        cfg_str = _config_to_str(specs, self.is_bilinear, self.is_blurbilinear, self.is_raw, self.is_3ch)
         for stale in [k for k in self.__dict__ if k.startswith("zzzgConfig_")]:
             delattr(self, stale)
         self.zzzgConfig = cfg_str
-        
-        setattr(self, f"zzzgConfig_{self.zzzgConfig}", Tensor([0.0]))
+
+    def _add_config_tensor(self):
+        if hasattr(self, 'zzzgConfig') and isinstance(self.zzzgConfig, str):
+            attr_name = f"zzzgConfig_{self.zzzgConfig}"
+            if not hasattr(self, attr_name):
+                setattr(self, attr_name, Tensor([0.0]))
+
+    def _remove_config_tensor(self):
+        for k in list(self.__dict__):
+            if k.startswith("zzzgConfig_"):
+                delattr(self, k)
 
     def load_weights(self, state: dict, strict: bool = True):
         cfg_key = next((k for k in state if k.startswith("zzzgConfig_")), None)

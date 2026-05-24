@@ -21,18 +21,244 @@ from model import (UpscaleNet, gaussian_blur,
 
 # ── loss helpers ──────────────────────────────────────────────────────────────
 
+#from nloss import NLossLoss
+#loss_fn = NLossLoss("nloss.safetensors")
+
 def loss_l1(pred: Tensor, target: Tensor) -> Tensor:
     return (pred - target).abs().mean()
 
 def loss_mse(pred: Tensor, target: Tensor) -> Tensor:
+    #print(target.shape) # (64, 1, 128, 128)
     return ((pred - target) ** 2).mean()
 
-def loss_lE(pred: Tensor, target: Tensor, z: Tensor) -> Tensor:
-    residual = pred - target
-    abs_residual = residual.abs()
-    noisy_target = target + abs_residual * z
-    return (pred - noisy_target).abs().mean()
+# NOTE: not actually lE loss. misnamed!
+#def loss_lE(pred: Tensor, target: Tensor, z: Tensor) -> Tensor:
+#    residual = pred - target
+#    abs_residual = residual.abs()
+#    noisy_target = target + abs_residual * z
+#    return (pred - noisy_target).abs().mean()
 
+# NOTE: not actually lE loss. misnamed! this is only the non-lE part of lE loss.
+# Proper lE loss requires some data from the network itself.
+#def loss_lE(mu: Tensor, hr: Tensor, z: Tensor) -> Tensor:
+#    sigma_gt = (hr - mu).abs()
+#    z = z * (sigma_gt > sigma_gt.mean())
+#    loss_main = (mu - hr + sigma_gt*z.detach()).abs().mean()
+#    return loss_main
+
+def ntlfb():
+    # =================================================================
+    # 2. FILTER BANK DEFINITION
+    # =================================================================
+    # Define High-Frequency Extractors (Sobel-style)
+    filter_bank = [
+        # DC offset intentionally left out
+        [[ 1.0,  0.0, -1.0], # 1, 0
+         [ 1.0,  0.0, -1.0],
+         [ 1.0,  0.0, -1.0]],
+         
+        [[ 0.5, -1.0,  0.5], # 2, 0
+         [ 0.5, -1.0,  0.5],
+         [ 0.5, -1.0,  0.5]],
+         
+         
+        [[ 1.0,  1.0,  1.0], # 0, 1
+         [ 0.0,  0.0,  0.0],
+         [-1.0, -1.0, -1.0]],
+         
+        [[ 1.0,  0.0, -1.0], # 1, 1
+         [ 0.0,  0.0,  0.0],
+         [-1.0,  0.0,  1.0]],
+         
+        [[ 0.5, -1.0,  0.5], # 2, 1
+         [ 0.0,  0.0,  0.0],
+         [-0.5,  1.0, -0.5]],
+         
+         
+        [[ 0.5,  0.5,  0.5], # 0, 2
+         [-1.0, -1.0, -1.0],
+         [ 0.5,  0.5,  0.5]],
+         
+        [[ 0.5,  0.0, -0.5], # 1, 2
+         [-1.0,  0.0,  1.0],
+         [ 0.5,  0.0, -0.5]],
+         
+        [[ 0.5, -1.0,  0.5], # 2, 2
+         [-1.0,  2.0, -1.0],
+         [ 0.5, -1.0,  0.5]],
+         
+        # not DCT kernels, but helpful
+        # pixelization
+        [[ 0.5,  1.0, -1.0],
+         [ 1.0,  1.5, -1.0],
+         [-1.0, -1.0,  0.0]],
+        [[-1.0,  1.0,  0.5],
+         [-1.0,  1.5,  1.0],
+         [ 0.0, -1.0, -1.0]],
+        [[-0.5, -1.0,  2.0],
+         [-1.0,  2.0, -1.0],
+         [ 2.0, -1.0, -0.5]],
+        [[ 2.0, -1.0, -0.5],
+         [-1.0,  2.0, -1.0],
+         [-0.5, -1.0,  2.0]],
+         
+        # diagonal gradients
+        [[ 0.0,  0.0,  2.0],
+         [ 0.0,  2.0, -3.0],
+         [ 2.0, -3.0,  0.0]],
+        [[ 2.0,  0.0,  0.0],
+         [-3.0,  2.0,  0.0],
+         [ 0.0, -3.0,  2.0]],
+        
+        # grid noise 
+        [[ 1.0, -1.0,  1.0],
+         [-1.0,  1.0, -1.0],
+         [ 1.0, -1.0,  1.0]],
+        [[ 1.0,  0.0,  1.0],
+         [ 0.0,  0.0,  0.0],
+         [ 1.0,  0.0,  1.0]],
+        [[ 0.5, -1.0,  0.5],
+         [ 0.0,  0.0,  0.0],
+         [ 0.5, -1.0,  0.5]],
+        [[ 0.5,  0.0,  0.5],
+         [-1.0,  0.0, -1.0],
+         [ 0.5,  0.0,  0.5]],
+        [[ 0.0,  0.0,  0.0],
+         [ 0.0,  1.0,  0.0],
+         [ 0.0,  0.0,  0.0]],
+    ]
+    
+    # =================================================================
+    # CENTERIZE & SELF-NORMALIZE KERNELS & KERNEL COUNT
+    # =================================================================
+    normalized_bank = []
+    for f in filter_bank:
+        # 1. Centerize (Zero-mean) the kernel to remove DC bias
+        mean_val = sum(val for row in f for val in row) / 9.0
+        centered_f = [[val - mean_val for val in row] for row in f]
+        
+        # 2. L1 Normalize AND scale down by the number of filters in the bank
+        abs_sum = sum(abs(val) for row in centered_f for val in row)
+        norm_factor = abs_sum if abs_sum > 0.0 else 1.0
+        normalized_bank.append([[val / norm_factor for val in row] for row in centered_f])
+    filter_bank = normalized_bank
+    return filter_bank
+
+ntlfb_filter_bank = ntlfb()
+
+def neighborhood_dct_texture_loss(
+    pred: Tensor,
+    target: Tensor,
+    w_l1: float = 1.0,
+    w_l2: float = 0.0,
+    w_tex: float = 0.4,
+    w_grad: float = 0.0,
+    w_l1_lowpass: float = 0.1,
+    mask_kernel: int = 3
+) -> Tensor:
+    # Require at least leakage amounts of DC reconstruction
+    if w_l1_lowpass < 0.1: w_l1_lowpass = 0.1
+    
+    # 1. Baseline Pixel Loss
+    loss_pixel = (pred - target).abs().mean()
+    loss_pixel_l2 = ((pred - target) ** 2).mean()
+    
+    # =================================================================
+    # MANUAL CONVOLUTION HELPERS
+    # =================================================================
+    
+    def apply_3x3_filter(t: Tensor, w: list[list[float]]) -> Tensor:
+        """Applies an arbitrary 3x3 filter kernel via manual slicing."""
+        # Initialize accumulator with zeros matching the output shape
+        out = t[:, :, 1:-1, 1:-1] * 0.0
+        
+        if w[0][0] != 0.0: out = out + t[:, :, :-2, :-2]  * w[0][0]
+        if w[0][1] != 0.0: out = out + t[:, :, :-2, 1:-1] * w[0][1]
+        if w[0][2] != 0.0: out = out + t[:, :, :-2, 2:]   * w[0][2]
+        
+        if w[1][0] != 0.0: out = out + t[:, :, 1:-1, :-2]  * w[1][0]
+        if w[1][1] != 0.0: out = out + t[:, :, 1:-1, 1:-1] * w[1][1]
+        if w[1][2] != 0.0: out = out + t[:, :, 1:-1, 2:]   * w[1][2]
+        
+        if w[2][0] != 0.0: out = out + t[:, :, 2:, :-2]  * w[2][0]
+        if w[2][1] != 0.0: out = out + t[:, :, 2:, 1:-1] * w[2][1]
+        if w[2][2] != 0.0: out = out + t[:, :, 2:, 2:]   * w[2][2]
+        
+        return out
+
+    def apply_triangle_blur(t: Tensor) -> Tensor:
+        """Separable [0.25, 0.5, 0.25] 3x3 lowpass blur."""
+        out = t[:, :, 1:-1, 1:-1] * 0.0
+        
+        out = out + t[:, :, :-2, :-2]   * (1.0/16.0)
+        out = out + t[:, :, :-2, 1:-1]  * (2.0/16.0)
+        out = out + t[:, :, :-2, 2:]    * (1.0/16.0)
+        
+        out = out + t[:, :, 1:-1, :-2]  * (2.0/16.0)
+        out = out + t[:, :, 1:-1, 1:-1] * (4.0/16.0)
+        out = out + t[:, :, 1:-1, 2:]   * (2.0/16.0)
+        
+        out = out + t[:, :, 2:, :-2]    * (1.0/16.0)
+        out = out + t[:, :, 2:, 1:-1]   * (2.0/16.0)
+        out = out + t[:, :, 2:, 2:]     * (1.0/16.0)
+        
+        return out
+
+    # =================================================================
+    # 3. NEIGHBORHOOD TEXTURE LOSS (Per Filter)
+    # =================================================================
+    total_neighborhood_loss = 0.0
+    
+    p = mask_kernel // 2
+    pool_pad = ((0, 0), (0, 0), (p, p), (p, p))
+
+    if w_tex > 0.0:
+        use_block_dct = True  # False = sliding DCT wavelet, True = block DCT
+        pred_pad = pred
+        target_pad = target
+        for f in ntlfb_filter_bank:
+            if use_block_dct:
+                B, C, H, W = pred_pad.shape
+                H3, W3 = (H // 3) * 3, (W // 3) * 3
+                p_trim = pred_pad  [:, :, :H3, :W3]
+                t_trim = target_pad[:, :, :H3, :W3]
+                p_blocks = p_trim.reshape(B, C, H3//3, 3, W3//3, 3).permute(0,1,3,5,2,4).reshape(B, C*9, H3//3, W3//3)
+                t_blocks = t_trim.reshape(B, C, H3//3, 3, W3//3, 3).permute(0,1,3,5,2,4).reshape(B, C*9, H3//3, W3//3)
+                flat_w = Tensor([f[r][c] for r in range(3) for c in range(3)] * C).reshape(1, C*9, 1, 1)
+                pred_mag   = (p_blocks * flat_w).reshape(B, C, 9, H3//3, W3//3).sum(axis=2).abs()
+                target_mag = (t_blocks * flat_w).reshape(B, C, 9, H3//3, W3//3).sum(axis=2).abs()
+                # We need all pixels to be influenced by all their neighbors, even those at their block edges, and
+                #  even if it causes overshoot (influence by something 5 pixels away).
+                # So we need to locally avgpool even though we're doing a block xform.
+                pred_mag   = pred_mag  .avg_pool2d(kernel_size=(mask_kernel, mask_kernel), stride=1)
+                target_mag = target_mag.avg_pool2d(kernel_size=(mask_kernel, mask_kernel), stride=1)
+            else:
+                # Extract high-frequency features for this specific filter shape
+                pred_feat   = apply_3x3_filter(pred_pad, f)
+                target_feat = apply_3x3_filter(target_pad, f)
+
+                pred_mag   = pred_feat  .abs().avg_pool2d(kernel_size=(mask_kernel, mask_kernel), stride=1)
+                target_mag = target_feat.abs().avg_pool2d(kernel_size=(mask_kernel, mask_kernel), stride=1)
+            
+            diffused_SE = (pred_mag - target_mag).abs() * Tensor.rand(pred_mag.shape) * 2.0
+            per_sample_rand = Tensor.rand(diffused_SE.shape[0]).reshape(-1, 1, 1, 1) * 2.0
+            total_neighborhood_loss = total_neighborhood_loss + (diffused_SE * per_sample_rand).mean()
+    
+    # =================================================================
+    # 4. LOWPASSED L1 LOSS
+    # =================================================================
+    if w_l1_lowpass > 0.0:
+        pred_blur = apply_triangle_blur(pred)
+        target_blur = apply_triangle_blur(target)
+        loss_lowpass = (pred_blur - target_blur).abs().mean()
+    else:
+        loss_lowpass = 0.0
+    
+    # 5. Combine and Return
+    return (loss_pixel * w_l1) + (loss_pixel_l2 * w_l2) \
+            + (total_neighborhood_loss * w_tex) + (loss_lowpass * w_l1_lowpass)
+
+loss_hd = neighborhood_dct_texture_loss
 
 # ── augmentation helpers ──────────────────────────────────────────────────────
 
@@ -189,7 +415,11 @@ class UpscaleDataset:
 def trysave(model, out_path):
     import time
     from safetensors.numpy import save_file as sf_save_numpy
+    model._add_config_tensor()
+    
     tensors_np = {k: v.numpy() for k, v in get_state_dict(model).items()}
+    # Because of transient OS-side file locking (e.g. windows defender passive scans)
+    #   we need to try saving multiple times.
     for attempt in range(3):
         try:
             sf_save_numpy(tensors_np, str(out_path))
@@ -197,7 +427,9 @@ def trysave(model, out_path):
         except Exception as e:
             print(e)
             if attempt < 2:
-                time.sleep(0.01)
+                time.sleep(0.02)
+    
+    model._remove_config_tensor()
     print("failed to save!")
 
 
@@ -255,7 +487,9 @@ def clip_grad_norm_(params, max_norm: float):
 # ── cosine LR ─────────────────────────────────────────────────────────────────
 
 def cosine_lr(epoch: int, total_epochs: int, lr_max: float, lr_min: float) -> float:
-    return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * epoch / total_epochs))
+    ret = lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * epoch / total_epochs))
+    i = min(float(epoch + 1.0) * 0.35, 1.0)
+    return ret * i
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
@@ -348,20 +582,26 @@ def train(args: argparse.Namespace):
     best_loss = float("inf")
 
     use_basic_loss = args.basic_loss
+
+    def _optstep():
+        clip_grad_norm_(params, max_norm=1.0)
+        opt.step()
+        for p in params:
+            p.assign(p.clamp(-3.99, 3.99))
+
     @TinyJit
     def train_step(lr_batch: Tensor, res_batch: Tensor, z: Tensor) -> Tensor:
         opt.zero_grad()
         pred = net(lr_batch)
         if use_basic_loss:
-            loss = loss_l1(pred, res_batch) + loss_mse(pred, res_batch)
+            loss = loss_l1(pred, res_batch) # + loss_mse(pred, res_batch)
         else:
-            loss = loss_lE(pred, res_batch, z)
-            #loss += (loss_l1(pred, res_batch) + loss_mse(pred, res_batch)) * 0.05
+            #loss = loss_fn(pred, res_batch) * 0.25 + loss_l1(pred, res_batch) * 0.75
+            #loss = loss_lE(pred, res_batch, z)
+            loss = loss_hd(pred, res_batch)
+            #loss = loss_l1(pred, res_batch)
         loss.backward()
-        clip_grad_norm_(params, max_norm=1.0)
-        opt.step()
-        for p in params:
-            p.assign(p.clamp(-3.99, 3.99))
+        _optstep()
         return loss.realize()
 
     chunk_size = max(1, len(dataset.pairs) // args.precompute_factor)
@@ -431,7 +671,7 @@ def main():
     p.add_argument("--out",          default="upscaler.safetensors")
     p.add_argument("--resume",       default=None)
     p.add_argument("--epochs",            type=int,   default=700)
-    p.add_argument("--batch-size",        type=int,   default=64)
+    p.add_argument("--batch-size",        type=int,   default=32)
     p.add_argument("--patch-size",        type=int,   default=64)
     p.add_argument("--n-aug",             type=int,   default=4)
     p.add_argument("--precompute-factor", type=int,   default=10)

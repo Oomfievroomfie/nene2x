@@ -33,7 +33,7 @@ def load_model(weights_path: str, do_wrap: bool = True) -> UpscaleNet:
     state = safe_load(weights_path)
     model.load_weights(state)
 
-    pad = sum((conv._k - 1) // 2
+    pad = sum((conv._k - 1) // 2 * conv._dilation
               for conv in [*model.layers, model._final_layer]
               if conv._k > 1)
     model.infer_pad = pad
