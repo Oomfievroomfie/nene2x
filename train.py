@@ -510,74 +510,70 @@ class UpscaleDataset:
         random.shuffle(self.pairs)
 
     def _add_image(self, hr: np.ndarray, n_aug: int, brightness_range: float):
-        blur_variants = [(hr, hr)]
-        precomputed = {}
-        for _, hr_for_lr in blur_variants:
-            key = id(hr_for_lr)
-            if key not in precomputed:
-                if SINC_DOWNSCALE_LOBES > 0 and random.random() < 0.5:
-                    lr = _sinc_downscale2x(hr_for_lr, SINC_DOWNSCALE_LOBES)
-                else:
-                    lr = manual_downscale2x(hr_for_lr)
-                # baseline_fn accepts numpy, returns numpy
-                baseline_fn = self.baseline_fn
-                if isinstance(lr, Tensor):
-                    lr = lr.numpy()
-                baseline_in = Tensor(lr)
-                baseline_out = baseline_fn(baseline_in)
-                if isinstance(baseline_out, Tensor):
-                    baseline_out = baseline_out.numpy()
-                precomputed[key] = (lr, baseline_out)
+        if SINC_DOWNSCALE_LOBES > 0 and random.random() < 0.5:
+            lr = _sinc_downscale2x(hr, SINC_DOWNSCALE_LOBES)
+        else:
+            lr = manual_downscale2x(hr)
+        if isinstance(lr, Tensor):
+            lr = lr.numpy()
+        baseline_out = self.baseline_fn(Tensor(lr))
+        if isinstance(baseline_out, Tensor):
+            baseline_out = baseline_out.numpy()
 
-        total_aug = n_aug * self.precompute_factor
-        for _ in range(total_aug):
-            hr_out, hr_for_lr = random.choice(blur_variants)
-            rot    = random.randint(0, 3)
-            flip   = random.random() > 0.5
-            brightness = random.uniform(0.5, 1.0) if random.random() > 0.5 else 1.0
-
-            lr, baseline = precomputed[id(hr_for_lr)]
-
-            a_out      = _orient(hr_out,   rot, flip)
-            a_lr       = _orient(lr,       rot, flip)
-            a_baseline = _orient(baseline, rot, flip)
-
-            if brightness != 1.0:
-                a_out      = a_out      * brightness
-                a_lr       = a_lr       * brightness
-                a_baseline = a_baseline * brightness
-
-            residual = a_out - a_baseline
-            self.pairs.append((a_lr.astype(np.float16), residual.astype(np.float16), a_baseline.astype(np.float16), a_out.astype(np.float16)))
-
-    def __len__(self) -> int:
-        return len(self.pairs) * self.patches_per_pair
-
-    def get_patch(self, pair_idx: int):
-        lr, residual, baseline, hr = self.pairs[pair_idx % len(self.pairs)]
         C, lH, lW = lr.shape
         ph  = self.patch_size
         pad = self.pad
 
-        if lH > ph + 2 * pad and lW > ph + 2 * pad:
-            ly = random.randint(pad, lH - ph - pad - 1)
-            lx = random.randint(pad, lW - ph - pad - 1)
-            lr       = lr      [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
-            residual = residual[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
-            baseline = baseline[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
-            hr       = hr      [:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
-        elif lH > ph and lW > ph:
-            ly = random.randint(0, lH - ph - 1)
-            lx = random.randint(0, lW - ph - 1)
-            lr       = lr      [:, ly : ly + ph,       lx : lx + ph      ]
-            residual = residual[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
-            baseline = baseline[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
-            hr       = hr      [:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
+        total_patches = n_aug * self.precompute_factor * self.patches_per_pair
+        for _ in range(total_patches):
+            # crop a patch from the full-resolution arrays
+            if lH > ph + 2 * pad and lW > ph + 2 * pad:
+                ly = random.randint(pad, lH - ph - pad - 1)
+                lx = random.randint(pad, lW - ph - pad - 1)
+                lr_p  = lr          [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
+                base_p = baseline_out[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
+                hr_p  = hr          [:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
+            elif lH > ph and lW > ph:
+                ly = random.randint(0, lH - ph - 1)
+                lx = random.randint(0, lW - ph - 1)
+                lr_p  = lr          [:, ly : ly + ph,       lx : lx + ph      ]
+                base_p = baseline_out[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
+                hr_p  = hr          [:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
+            else:
+                lr_p   = lr
+                base_p = baseline_out
+                hr_p   = hr
 
-        if self.is_3ch:
-            return lr, residual, baseline, hr
-        c = random.randrange(C)
-        return lr[c:c+1], residual[c:c+1], baseline[c:c+1], hr[c:c+1]
+            rot    = random.randint(0, 3)
+            flip   = random.random() > 0.5
+            brightness = random.uniform(0.5, 1.0) if random.random() > 0.5 else 1.0
+
+            a_lr   = _orient(lr_p,   rot, flip)
+            a_base = _orient(base_p, rot, flip)
+            a_hr   = _orient(hr_p,   rot, flip)
+
+            if brightness != 1.0:
+                a_lr   = a_lr   * brightness
+                a_base = a_base * brightness
+                a_hr   = a_hr   * brightness
+
+            residual = a_hr - a_base
+
+            if not self.is_3ch:
+                c = random.randrange(C)
+                a_lr      = a_lr[c:c+1]
+                a_base    = a_base[c:c+1]
+                residual  = residual[c:c+1]
+                a_hr      = a_hr[c:c+1]
+
+            self.pairs.append((a_lr.astype(np.float16), residual.astype(np.float16), a_base.astype(np.float16), a_hr.astype(np.float16)))
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def get_patch(self, patch_idx: int):
+        lr, residual, baseline, hr = self.pairs[patch_idx % len(self.pairs)]
+        return lr, residual, baseline, hr
 
 
 # ── saving ────────────────────────────────────────────────────────────────────
@@ -613,31 +609,12 @@ def trysave(model, out_path, sigma_branch=None, filter_net=None):
 # ── validation ────────────────────────────────────────────────────────────────
 
 def run_validation(model, val_dataset, device_str) -> float:
-    ph  = val_dataset.patch_size
-    pad = val_dataset.pad
-
     Tensor.training = False
     total = 0.0
     n = 0
-    for lr, residual, baseline, hr in val_dataset.pairs:
-        C, lH, lW = lr.shape
-        if lH > ph + 2 * pad and lW > ph + 2 * pad:
-            ly = (lH - ph) // 2
-            lx = (lW - ph) // 2
-            lr_patch  = lr      [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
-            res_patch = residual[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
-        elif lH > ph and lW > ph:
-            ly = (lH - ph) // 2
-            lx = (lW - ph) // 2
-            lr_patch  = lr      [:, ly : ly + ph,       lx : lx + ph      ]
-            res_patch = residual[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
-        else:
-            lr_patch  = lr
-            res_patch = residual
-
-        lr_in  = Tensor(lr_patch[np.newaxis])    # (1, C, H, W)
-        res_in = Tensor(res_patch[np.newaxis])
-
+    for lr_patch, res_patch, _baseline, _hr in val_dataset.pairs:
+        lr_in  = Tensor(lr_patch.astype(np.float32)[np.newaxis])
+        res_in = Tensor(res_patch.astype(np.float32)[np.newaxis])
         pred = model(lr_in)
         pl = (loss_l1(pred, res_in) + loss_mse(pred, res_in)).numpy().item()
         total += pl
@@ -828,7 +805,7 @@ def train(args: argparse.Namespace):
 
     filter_params = list(get_state_dict(filter_net).values()) if filter_net is not None else []
     
-    opt_filter = AdamW(filter_params, lr=5e-6, b1=0.5, b2=0.9, weight_decay=1e-4) if filter_net is not None else None
+    opt_filter = AdamW(filter_params, lr=1e-4, b1=0.5, b2=0.9, weight_decay=1e-4) if filter_net is not None else None
 
     def _optstep():
         clip_grad_norm_(params, max_norm=1.0)
@@ -904,9 +881,8 @@ def train(args: argparse.Namespace):
         chunk_idx = (epoch - 1) % args.precompute_factor
         start_p = chunk_idx * chunk_size
         end_p   = min(start_p + chunk_size, len(dataset.pairs))
-        active_pair_indices = list(range(start_p, end_p))
 
-        indices = active_pair_indices * args.patches_per_pair
+        indices = list(range(start_p, end_p))
         random.shuffle(indices)
 
         running_loss = 0.0

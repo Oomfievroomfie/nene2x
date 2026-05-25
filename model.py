@@ -401,7 +401,7 @@ class FilterNet:
     """
     def __init__(self, mid: int = 32):
         midh = (mid * 3) // 2
-        self.conv1 = Conv2dManual(1, 24, 3)
+        self.conv1 = Conv2dManual(1, 24, 3, bias=False)
         #self.conv1 = Conv2dManual(1, 12, 3)
         #self.conv2 = Conv2dManual(12, 24, 3, dilation=2)
         #self.conv3 = Conv2dManual(24, 24, 3)
