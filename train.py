@@ -15,7 +15,7 @@ from tinygrad import Tensor, TinyJit
 from tinygrad.nn.optim import AdamW
 from tinygrad.nn.state import get_state_dict, safe_save, safe_load
 
-from model import (UpscaleNet, gaussian_blur,
+from model import (UpscaleNet, SigmaBranch, FilterNet, gaussian_blur,
                    manual_downscale2x, upscale_edi_2x, upsample2x, box_blur5x5_np)
 
 
@@ -45,6 +45,47 @@ def loss_mse(pred: Tensor, target: Tensor) -> Tensor:
 #    z = z * (sigma_gt > sigma_gt.mean())
 #    loss_main = (mu - hr + sigma_gt*z.detach()).abs().mean()
 #    return loss_main
+
+def loss_lE(mu: Tensor, hr: Tensor, sigma: Tensor = None, beta: float = 0.01) -> Tensor:
+    """
+    ℓE loss from "Revisiting ℓ1 Loss in Super-Resolution" (arXiv:2201.10084).
+
+    Eq. (10): Ez[ |ŷ - (μ + |ŷ - μ| * z)| ]
+      = Ez[ |(ŷ - μ) - |ŷ - μ| * z| ]
+      Backprop flows through |ŷ - μ| (NOT detached) — that's the key property
+      that keeps gradient direction correct (Lemma III.1).
+
+    Eq. (13): β * | |ŷ - μ|.detach() - σ |₁  (auxiliary σ branch loss)
+      Paper §IV-C: pixels where |ŷ - μ| < mean are masked to zero before
+      this auxiliary loss so σ focuses on hard/high-freq samples.
+      
+    Paper's choice of beta is 0.01, implicitly PSNR-optimized. You should
+      probably use a higher value.
+    
+    The depixelation loss addition is also not in the paper.
+    """
+    # Algorithm 1 (paper §V) — transcribed exactly:
+    #   sigma_gt = abs(hr - mu)
+    #   z = randn(hr.shape)
+    #   z = z * (sigma_gt > mean(sigma_gt))   # zero easy samples
+    #   loss_main = mean(abs(mu + sigma_gt * z.detach() - hr))
+    #   loss_aux  = mean(abs(sigma_pre - sigma_gt.detach()))
+    #   return loss_main + beta * loss_aux
+    beta = 0.2
+    sigma_gt = (hr - mu).abs()
+    z = Tensor.randn(*mu.shape)
+    z = z * (sigma_gt > sigma_gt.mean()).detach()
+    main_loss = (mu + sigma_gt * z.detach() - hr).abs().mean()
+
+    if sigma is not None:
+        aux_loss = (sigma - sigma_gt.detach()).abs().mean()
+        main_loss = main_loss + beta * aux_loss
+
+    if LE_DEPIX_WEIGHT > 0.0:
+        main_loss = main_loss + loss_depix(mu, hr) * LE_DEPIX_WEIGHT
+
+    return main_loss
+
 
 def ntlfb():
     # =================================================================
@@ -307,6 +348,43 @@ def neighborhood_dct_texture_loss(
 
 loss_hd = neighborhood_dct_texture_loss
 
+# Weight for depixelation penalty applied to ℓE loss (0.0 = disabled)
+LE_DEPIX_WEIGHT: float = 0.1
+
+def loss_depix(pred: Tensor, target: Tensor) -> Tensor:
+    """Penalize false sharp edges at inter-source-pixel boundaries (2× upscaler)."""
+    W = min(pred.shape[3], target.shape[3])
+    H = min(pred.shape[2], target.shape[2])
+
+    eh = (H // 2) * 2
+    p_h = (pred  [:, :, :eh, :W][:, :, 0::2, :] + pred  [:, :, :eh, :W][:, :, 1::2, :]) * 0.5
+    t_h = (target[:, :, :eh, :W][:, :, 0::2, :] + target[:, :, :eh, :W][:, :, 1::2, :]) * 0.5
+    n = (W - 1) // 2
+    loss_h = ((p_h[:, :, :, 1::2][:, :, :, :n] - p_h[:, :, :, 2::2][:, :, :, :n]).abs()
+            - (t_h[:, :, :, 1::2][:, :, :, :n] - t_h[:, :, :, 2::2][:, :, :, :n]).abs()).relu().mean()
+
+    ew = (W // 2) * 2
+    p_v = (pred  [:, :, :H, :ew][:, :, :, 0::2] + pred  [:, :, :H, :ew][:, :, :, 1::2]) * 0.5
+    t_v = (target[:, :, :H, :ew][:, :, :, 0::2] + target[:, :, :H, :ew][:, :, :, 1::2]) * 0.5
+    m = (H - 1) // 2
+    loss_v = ((p_v[:, :, 1::2, :][:, :, :m, :] - p_v[:, :, 2::2, :][:, :, :m, :]).abs()
+            - (t_v[:, :, 1::2, :][:, :, :m, :] - t_v[:, :, 2::2, :][:, :, :m, :]).abs()).relu().mean()
+
+    return (loss_h + loss_v) * 0.5
+
+def loss_adv_filter_upscaler(pred: Tensor, target: Tensor, filter_net: "FilterNet") -> Tensor:
+    """Generator-side loss: penalize pred by the adversarial filter score."""
+    diff = pred - target
+    return filter_net(diff).mean()
+
+
+def loss_adv_filter_discriminator(pred: Tensor, target: Tensor, filter_net: "FilterNet") -> Tensor:
+    """Discriminator-side loss: filter_net should score high on real errors.
+    Uses detached pred so gradients don't flow back to the upscaler."""
+    diff = pred.detach() - target
+    return -filter_net(diff).mean()
+
+
 # ── sinc downscale ────────────────────────────────────────────────────────────
 
 # Number of lobes for Lanczos sinc downscale used during LR generation.
@@ -470,13 +548,13 @@ class UpscaleDataset:
                 a_baseline = a_baseline * brightness
 
             residual = a_out - a_baseline
-            self.pairs.append((a_lr.astype(np.float32), residual.astype(np.float32)))
+            self.pairs.append((a_lr.astype(np.float16), residual.astype(np.float16), a_baseline.astype(np.float16), a_out.astype(np.float16)))
 
     def __len__(self) -> int:
         return len(self.pairs) * self.patches_per_pair
 
     def get_patch(self, pair_idx: int):
-        lr, residual = self.pairs[pair_idx % len(self.pairs)]
+        lr, residual, baseline, hr = self.pairs[pair_idx % len(self.pairs)]
         C, lH, lW = lr.shape
         ph  = self.patch_size
         pad = self.pad
@@ -486,27 +564,37 @@ class UpscaleDataset:
             lx = random.randint(pad, lW - ph - pad - 1)
             lr       = lr      [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
             residual = residual[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
+            baseline = baseline[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
+            hr       = hr      [:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
         elif lH > ph and lW > ph:
             ly = random.randint(0, lH - ph - 1)
             lx = random.randint(0, lW - ph - 1)
             lr       = lr      [:, ly : ly + ph,       lx : lx + ph      ]
             residual = residual[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
+            baseline = baseline[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
+            hr       = hr      [:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
 
         if self.is_3ch:
-            return lr, residual  # (3, H, W) and (3, 2H, 2W)
+            return lr, residual, baseline, hr
         c = random.randrange(C)
-        return lr[c:c+1], residual[c:c+1]
+        return lr[c:c+1], residual[c:c+1], baseline[c:c+1], hr[c:c+1]
 
 
 # ── saving ────────────────────────────────────────────────────────────────────
 
 
-def trysave(model, out_path):
+def trysave(model, out_path, sigma_branch=None, filter_net=None):
     import time
     from safetensors.numpy import save_file as sf_save_numpy
     model._add_config_tensor()
-    
+
     tensors_np = {k: v.numpy() for k, v in get_state_dict(model).items()}
+    if sigma_branch is not None:
+        for k, v in get_state_dict(sigma_branch).items():
+            tensors_np[f"sigma_branch.{k}"] = v.numpy()
+    if filter_net is not None:
+        for k, v in get_state_dict(filter_net).items():
+            tensors_np[f"filter_net.{k}"] = v.numpy()
     # Because of transient OS-side file locking (e.g. windows defender passive scans)
     #   we need to try saving multiple times.
     for attempt in range(3):
@@ -517,7 +605,7 @@ def trysave(model, out_path):
             print(e)
             if attempt < 2:
                 time.sleep(0.02)
-    
+
     model._remove_config_tensor()
     print("failed to save!")
 
@@ -531,7 +619,7 @@ def run_validation(model, val_dataset, device_str) -> float:
     Tensor.training = False
     total = 0.0
     n = 0
-    for lr, residual in val_dataset.pairs:
+    for lr, residual, baseline, hr in val_dataset.pairs:
         C, lH, lW = lr.shape
         if lH > ph + 2 * pad and lW > ph + 2 * pad:
             ly = (lH - ph) // 2
@@ -597,24 +685,88 @@ def train(args: argparse.Namespace):
         import shutil
         import tempfile
         import os
-        
+
         fd, temp_path = tempfile.mkstemp(suffix=".safetensors")
         os.close(fd)
         shutil.copy(args.resume, temp_path)
-        
+
         state = safe_load(temp_path)
         net.load_weights(state)
-        
+
         try:
             os.remove(temp_path)
         except OSError:
             pass
-            
+
         print(f"Resumed weights from {args.resume}")
-    
+
+    filter_net = None
+    if args.adv_filter_loss:
+        filter_net = FilterNet()
+        if args.resume and Path(args.resume).exists():
+            import shutil, tempfile, os
+            fd, temp_path = tempfile.mkstemp(suffix=".safetensors")
+            os.close(fd)
+            shutil.copy(args.resume, temp_path)
+            state = safe_load(temp_path)
+            fn_state = {k[len("filter_net."):]: v
+                        for k, v in state.items() if k.startswith("filter_net.")}
+            if fn_state:
+                from tinygrad.nn.state import load_state_dict as tg_load_state_dict
+                tg_load_state_dict(filter_net, fn_state)
+                print("Resumed filter_net weights")
+            else:
+                print("No filter_net weights in checkpoint — starting fresh")
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+    sigma_branch = None
+    if args.le_loss:
+        # Determine pre-final feature channel count from the final layer's input channels.
+        # final layer weight shape: (out_c, in_c_per_group, k, k)
+        final_w = net._final_layer.weight
+        final_in_c = final_w.shape[1] * net._final_layer.groups
+        out_c = 3 if net.is_3ch else 1  # channels after pixel-shuffle
+        sigma_branch = SigmaBranch(final_in_c, out_c, is_3ch=net.is_3ch)
+
+        if args.resume and Path(args.resume).exists():
+            import shutil, tempfile, os
+            fd, temp_path = tempfile.mkstemp(suffix=".safetensors")
+            os.close(fd)
+            shutil.copy(args.resume, temp_path)
+            state = safe_load(temp_path)
+            sigma_state = {k[len("sigma_branch."):]: v
+                           for k, v in state.items() if k.startswith("sigma_branch.")}
+            if sigma_state:
+                from tinygrad.nn.state import load_state_dict as tg_load_state_dict
+                tg_load_state_dict(sigma_branch, sigma_state)
+                print("Resumed sigma branch weights")
+            else:
+                print("No sigma branch weights in checkpoint — starting sigma branch fresh")
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+    net_params    = sum(p.numpy().size for p in get_state_dict(net).values())
+    sigma_params  = sum(p.numpy().size for p in get_state_dict(sigma_branch).values()) if sigma_branch is not None else 0
+    filter_params = sum(p.numpy().size for p in get_state_dict(filter_net).values()) if filter_net is not None else 0
+    extra = ""
+    if sigma_branch is not None:
+        extra += f" + {sigma_params:,} (sigma)"
+    if filter_net is not None:
+        extra += f" + {filter_params:,} (filter_net)"
+    if extra:
+        print(f"Parameters: {net_params:,} (net){extra} = {net_params+sigma_params+filter_params:,}")
+    else:
+        print(f"Parameters: {net_params:,}")
+
     params = list(get_state_dict(net).values())
-    total_params = sum(p.numpy().size for p in params)
-    print(f"Parameters: {total_params:,}")
+    if sigma_branch is not None:
+        params = params + list(get_state_dict(sigma_branch).values())
+    # filter_net has its own optimizer — not added to main params
 
     pad = sum((conv._k - 1) // 2 * conv._dilation
               for conv in [*net.layers, net._final_layer]
@@ -623,7 +775,7 @@ def train(args: argparse.Namespace):
     if pad > 0:
         net.set_padding_enabled(False)
 
-    trysave(net, out_path)
+    trysave(net, out_path, sigma_branch, filter_net)
 
     if net.is_raw:
         def baseline_fn(t):
@@ -671,6 +823,14 @@ def train(args: argparse.Namespace):
     best_loss = float("inf")
 
     use_basic_loss = not args.fancy_loss
+    use_le_loss = args.le_loss
+    use_adv_filter = args.adv_filter_loss
+
+    filter_params = list(get_state_dict(filter_net).values()) if filter_net is not None else []
+    
+    # lr 1e-4: oscillation
+    # lr 1e-5: too slow
+    opt_filter = AdamW(filter_params, lr=1e-4, b1=0.5, b2=0.9, weight_decay=0.0) if filter_net is not None else None
 
     def _optstep():
         clip_grad_norm_(params, max_norm=1.0)
@@ -678,20 +838,62 @@ def train(args: argparse.Namespace):
         for p in params:
             p.assign(p.clamp(-3.99, 3.99))
 
-    @TinyJit
-    def train_step(lr_batch: Tensor, res_batch: Tensor, z: Tensor) -> Tensor:
-        opt.zero_grad()
-        pred = net(lr_batch)
-        if use_basic_loss:
-            loss = loss_l1(pred, res_batch) # + loss_mse(pred, res_batch)
-        else:
-            #loss = loss_fn(pred, res_batch) * 0.25 + loss_l1(pred, res_batch) * 0.75
-            #loss = loss_lE(pred, res_batch, z)
+    def _filter_optstep():
+        opt_filter.step()
+        filter_net.clamp_weights(0.2)
+
+    if use_adv_filter:
+        @TinyJit
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
+            pred = net(lr_batch)
+            pred_full = pred + base_batch
+
+            # Generator step: softplus(-D(pred)) large when pred scores negative, near-zero when pred fools critic
+            # filter_net grads from gen_loss are discarded by opt_filter.zero_grad() before disc step
+            dc = hr_batch.mean(axis=(2, 3), keepdim=True)
+            opt.zero_grad()
+            d_pred = filter_net(pred_full - dc)
+            gen_loss = 0.01 * (pred - res_batch).abs().mean() + 0.1 * (-d_pred).softplus().mean()
+            gen_loss.backward()
+            _optstep()
+
+            # Discriminator step: WGAN critic minimizes D(pred)-D(hr), pushing pred negative and hr positive
+            opt_filter.zero_grad()
+            d_pred_detached = filter_net((pred_full - dc).detach())
+            d_hr = filter_net(hr_batch - dc)
+            disc_loss = d_pred_detached.mean() - d_hr.mean() + d_pred_detached.relu().mean() + (-d_hr).relu().mean()
+            disc_loss.backward()
+            _filter_optstep()
+
+            return Tensor.stack(gen_loss, d_pred.mean(), d_hr.mean()).realize()
+    elif use_le_loss:
+        @TinyJit
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
+            opt.zero_grad()
+            pred, feats = net.forward_with_features(lr_batch)
+            sigma = sigma_branch(feats)
+            loss = loss_lE(pred, res_batch, sigma=sigma, beta=args.le_beta)
+            loss.backward()
+            _optstep()
+            return loss.realize()
+    elif use_basic_loss:
+        @TinyJit
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
+            opt.zero_grad()
+            pred = net(lr_batch)
+            loss = loss_l1(pred, res_batch)
+            loss.backward()
+            _optstep()
+            return loss.realize()
+    else:
+        @TinyJit
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
+            opt.zero_grad()
+            pred = net(lr_batch)
             loss = loss_hd(pred, res_batch)
-            #loss = loss_l1(pred, res_batch)
-        loss.backward()
-        _optstep()
-        return loss.realize()
+            loss.backward()
+            _optstep()
+            return loss.realize()
 
     chunk_size = max(1, len(dataset.pairs) // args.precompute_factor)
 
@@ -710,6 +912,8 @@ def train(args: argparse.Namespace):
         random.shuffle(indices)
 
         running_loss = 0.0
+        running_d_pred = 0.0
+        running_d_hr = 0.0
         steps = 0
 
         pbar = tqdm(range(0, len(indices) - args.batch_size + 1, args.batch_size),
@@ -718,32 +922,48 @@ def train(args: argparse.Namespace):
         for batch_start in pbar:
             batch_idx = indices[batch_start : batch_start + args.batch_size]
 
-            lr_list, res_list = [], []
+            lr_list, res_list, base_list, hr_list = [], [], [], []
             for pair_i in batch_idx:
-                lr_p, res_p = dataset.get_patch(pair_i)
+                lr_p, res_p, base_p, hr_p = dataset.get_patch(pair_i)
                 lr_list.append(lr_p)
                 res_list.append(res_p)
+                base_list.append(base_p)
+                hr_list.append(hr_p)
 
-            lr_batch  = Tensor(np.stack(lr_list,  axis=0).astype(np.float32))
-            res_batch = Tensor(np.stack(res_list, axis=0).astype(np.float32))
-            z_batch   = Tensor(np.random.randn(*res_batch.shape).astype(np.float32))
+            lr_batch   = Tensor(np.stack(lr_list,   axis=0).astype(np.float32))
+            res_batch  = Tensor(np.stack(res_list,  axis=0).astype(np.float32))
+            base_batch = Tensor(np.stack(base_list, axis=0).astype(np.float32))
+            hr_batch   = Tensor(np.stack(hr_list,   axis=0).astype(np.float32))
+            z_batch    = Tensor(np.random.randn(*res_batch.shape).astype(np.float32))
 
-            loss = train_step(lr_batch, res_batch, z_batch)
-            running_loss += loss.numpy().item()
+            out = train_step(lr_batch, res_batch, base_batch, hr_batch, z_batch)
+            if use_adv_filter:
+                vals = out.numpy()
+                running_loss   += vals[0]
+                running_d_pred += vals[1]
+                running_d_hr   += vals[2]
+            else:
+                running_loss += out.numpy().item()
             steps += 1
 
         avg_loss = running_loss / max(steps, 1)
 
+        filter_suffix = ""
+        if use_adv_filter:
+            avg_d_pred = running_d_pred / max(steps, 1)
+            avg_d_hr   = running_d_hr   / max(steps, 1)
+            filter_suffix = f" | d_pred {avg_d_pred:.4f}  d_hr {avg_d_hr:.4f}"
+
         if args.strict_validation:
             val_loss = run_validation(net, val_dataset, "cpu")
-            print(f"Epoch {epoch:4d} | train {avg_loss:.6f} | val {val_loss:.6f} | lr {new_lr:.2e}")
+            print(f"Epoch {epoch:4d} | train {avg_loss:.6f} | val {val_loss:.6f} | lr {new_lr:.2e}{filter_suffix}")
             if val_loss < best_loss:
                 best_loss = val_loss
-                trysave(net, out_path)
+                trysave(net, out_path, sigma_branch, filter_net)
                 print(f"  saved {out_path}  (best val loss {best_loss:.6f})")
         else:
-            print(f"Epoch {epoch:4d} | loss {avg_loss:.6f} | lr {new_lr:.2e}")
-            trysave(net, out_path)
+            print(f"Epoch {epoch:4d} | loss {avg_loss:.6f} | lr {new_lr:.2e}{filter_suffix}")
+            trysave(net, out_path, sigma_branch, filter_net)
 
     print("Training complete.")
 
@@ -770,6 +990,9 @@ def main():
     p.add_argument("--num-workers",       type=int,   default=4)
     p.add_argument("--leaky-slope",       type=float, default=0.003)
     p.add_argument("--fancy-loss",        action="store_true")
+    p.add_argument("--le-loss",           action="store_true", help="Use ℓE loss (arXiv:2201.10084)")
+    p.add_argument("--le-beta",           type=float, default=0.01, help="Penalty factor β for σ auxiliary loss")
+    p.add_argument("--adv-filter-loss",   action="store_true", help="Use adversarial filter network loss")
     p.add_argument("--strict-validation", action="store_true")
     p.add_argument("--val-data",          default=None)
     args = p.parse_args()

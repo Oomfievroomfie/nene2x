@@ -334,15 +334,27 @@ class UpscaleNet:
             if conv._k > 1:
                 conv.padding_enabled = enabled
 
-    def __call__(self, x: Tensor) -> Tensor:
+    def __call__(self, x: Tensor, return_features: bool = False) -> Tensor:
         for conv in self.layers:
             x = conv(x).leaky_relu(LEAKY_SLOPE)
+        if return_features:
+            return x
         x = self._final_layer(x)
         return pixel_shuffle(x, 2)
+
+    def forward_with_features(self, x: Tensor) -> tuple:
+        """Returns (pred, pre_final_features) for use with sigma branch."""
+        feats = self.__call__(x, return_features=True)
+        pred = pixel_shuffle(self._final_layer(feats), 2)
+        return pred, feats
 
     @TinyJit
     def _jit_call(self, x: Tensor) -> Tensor:
         return self.__call__(x)
+
+    @TinyJit
+    def _jit_call_with_features(self, x: Tensor) -> tuple:
+        return self.forward_with_features(x)
 
     def upscale_channel(self, lr: Tensor) -> Tensor:
         """lr: (H,W) for 1-channel models, or (3,H,W) for 3-channel models."""
@@ -375,6 +387,71 @@ class UpscaleNet:
             # returns (3, 2H, 2W)
             return (base + residual).squeeze(0).clamp(0.0, 1.0)
         return (base + residual).squeeze(0).squeeze(0).clamp(0.0, 1.0)
+
+
+# ── Adversarial filter network ────────────────────────────────────────────────
+
+class FilterNet:
+    """
+    WGAN critic that operates on full reconstructed images (pred + baseline, or hr).
+    Standard WGAN critic: scores hr high and pred low. Generator loss uses softplus(-D(pred)),
+    which is large when pred scores low and shrinks toward zero as pred fools the critic.
+    Trained with a separate optimizer and weight clamping for Lipschitz constraint.
+    """
+    def __init__(self, mid: int = 32):
+        midh = (mid * 3) // 2
+        self.conv1 = Conv2dManual(1, 16, 3)
+        self.conv2 = Conv2dManual(16, 32, 3)
+        self.conv3 = Conv2dManual(32, 48, 3)
+        self.conv4 = Conv2dManual(48, 64, 3)
+        self.conv5 = Conv2dManual(64, 72, 3)
+        self.conv6 = Conv2dManual(72, 96, 3)
+        self.head  = Conv2dManual(96, 1, 1, bias=False)
+
+    def __call__(self, x: Tensor) -> Tensor:
+        x = self.conv1(x).leaky_relu(0.1)
+        x = self.conv2(x).leaky_relu(0.1)
+        x = self.conv3(x).leaky_relu(0.1)
+        x = self.conv4(x).leaky_relu(0.1)
+        x = self.conv5(x).leaky_relu(0.1)
+        x = self.conv6(x).leaky_relu(0.1)
+        return self.head(x)
+
+    def clamp_weights(self, c: float = 0.1):
+        for attr in ("conv1", "conv2", "conv3", "conv4", "conv5", "conv6", "head"):
+            cx = c
+            if attr == "head":
+                cx *= 10.0
+            conv = getattr(self, attr)
+            conv.weight = conv.weight.clamp(-cx, cx)
+            if conv.bias is not None:
+                conv.bias = conv.bias.clamp(-cx, cx)
+
+
+# ── Sigma branch for ℓE loss ──────────────────────────────────────────────────
+
+class SigmaBranch:
+    """
+    Lightweight branch that predicts per-pixel σ from pre-final backbone features.
+    σ is used only during training (ℓE loss); discarded at inference.
+    Output shape matches the pixel-shuffled prediction: (B, C_out//4, 2H, 2W).
+
+    The paper (arXiv:2201.10084 Fig. 3) uses: 4× (Conv 3×3 + PReLU) with 160 channels,
+    followed by a pixel-shuffle upsampler (Conv 3×3 + PixelShuffle). That's designed for
+    EDSR-scale nets (1.4M–40M params). Here we use a single 3×3 + 1×1 head with
+    mid = clamp(in_c // 8, 8, 48) to keep the branch small relative to tiny nets.
+    """
+    def __init__(self, in_c: int, out_c: int, is_3ch: bool = False):
+        mid = max(8, min(in_c // 8, 48))
+        self.conv1 = Conv2dManual(in_c, mid, 3)
+        self.prelu_slope = Tensor.full((mid,), 0.25)  # learnable PReLU slope per channel
+        self.head  = Conv2dManual(mid, out_c * 4, 1)  # out_c*4 → pixel_shuffle → out_c
+
+    def __call__(self, feats: Tensor) -> Tensor:
+        x = self.conv1(feats)
+        x = x.maximum(0) + self.prelu_slope.reshape(1, -1, 1, 1) * x.minimum(0)
+        x = self.head(x)
+        return pixel_shuffle(x, 2).sigmoid()
 
 
 # ── numpy utility functions (used by dataset preprocessing and inference) ─────
