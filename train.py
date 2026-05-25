@@ -88,20 +88,7 @@ def ntlfb():
          [ 0.5, -1.0,  0.5]],
          
         # not DCT kernels, but helpful
-        # pixelization
-        [[ 0.5,  1.0, -1.0],
-         [ 1.0,  1.5, -1.0],
-         [-1.0, -1.0,  0.0]],
-        [[-1.0,  1.0,  0.5],
-         [-1.0,  1.5,  1.0],
-         [ 0.0, -1.0, -1.0]],
-        [[-0.5, -1.0,  2.0],
-         [-1.0,  2.0, -1.0],
-         [ 2.0, -1.0, -0.5]],
-        [[ 2.0, -1.0, -0.5],
-         [-1.0,  2.0, -1.0],
-         [-0.5, -1.0,  2.0]],
-         
+        
         # diagonal gradients
         [[ 0.0,  0.0,  2.0],
          [ 0.0,  2.0, -3.0],
@@ -109,23 +96,45 @@ def ntlfb():
         [[ 2.0,  0.0,  0.0],
          [-3.0,  2.0,  0.0],
          [ 0.0, -3.0,  2.0]],
-        
-        # grid noise 
-        [[ 1.0, -1.0,  1.0],
-         [-1.0,  1.0, -1.0],
-         [ 1.0, -1.0,  1.0]],
-        [[ 1.0,  0.0,  1.0],
-         [ 0.0,  0.0,  0.0],
-         [ 1.0,  0.0,  1.0]],
-        [[ 0.5, -1.0,  0.5],
-         [ 0.0,  0.0,  0.0],
-         [ 0.5, -1.0,  0.5]],
-        [[ 0.5,  0.0,  0.5],
-         [-1.0,  0.0, -1.0],
-         [ 0.5,  0.0,  0.5]],
-        [[ 0.0,  0.0,  0.0],
+         
+        [[ 0.0,  1.0,  0.0],
+         [ 1.0,  0.0, -1.0],
+         [ 0.0, -1.0,  1.0]],
+        [[ 0.0,  1.0,  0.0],
+         [-1.0,  0.0,  1.0],
+         [ 0.0, -1.0,  0.0]],
+         
+        [[ 1.0,  0.0, -1.0],
          [ 0.0,  1.0,  0.0],
+         [-1.0,  0.0,  1.0]],
+        [[-1.0,  0.0,  1.0],
+         [ 0.0,  1.0,  0.0],
+         [ 1.0,  0.0, -1.0]],
+        
+        # small edges
+        [[ 1.0, -1.0,  0.0],
+         [ 1.0, -1.0,  0.0],
          [ 0.0,  0.0,  0.0]],
+        [[ 1.0,  1.0,  0.0],
+         [-1.0, -1.0,  0.0],
+         [ 0.0,  0.0,  0.0]],
+        #
+        ## grid noise 
+        #[[ 1.0, -1.0,  1.0],
+        # [-1.0,  1.0, -1.0],
+        # [ 1.0, -1.0,  1.0]],
+        #[[ 1.0,  0.0,  1.0],
+        # [ 0.0,  0.0,  0.0],
+        # [ 1.0,  0.0,  1.0]],
+        #[[ 0.5, -1.0,  0.5],
+        # [ 0.0,  0.0,  0.0],
+        # [ 0.5, -1.0,  0.5]],
+        #[[ 0.5,  0.0,  0.5],
+        # [-1.0,  0.0, -1.0],
+        # [ 0.5,  0.0,  0.5]],
+        #[[ 0.0,  0.0,  0.0],
+        # [ 0.0,  1.0,  0.0],
+        # [ 0.0,  0.0,  0.0]],
     ]
     
     # =================================================================
@@ -151,9 +160,10 @@ def neighborhood_dct_texture_loss(
     target: Tensor,
     w_l1: float = 1.0,
     w_l2: float = 0.0,
-    w_tex: float = 0.4,
+    w_tex: float = 0.7,
     w_grad: float = 0.0,
     w_l1_lowpass: float = 0.1,
+    w_depix: float = 0.2,
     mask_kernel: int = 3
 ) -> Tensor:
     # Require at least leakage amounts of DC reconstruction
@@ -254,11 +264,87 @@ def neighborhood_dct_texture_loss(
     else:
         loss_lowpass = 0.0
     
-    # 5. Combine and Return
+    # =================================================================
+    # 5. PIXELATION DETECTOR LOSS
+    # =================================================================
+    # Penalize false sharp edges at inter-source-pixel boundaries.
+    # In a 2x upscaler, columns 2k and 2k+1 come from the same source pixel,
+    # so x=1,3,5,... -> x=2,4,6,... are inter-block boundaries.
+    # Pixelation = pred is sharper there than target is.
+    if w_depix > 0.0:
+        W = min(pred.shape[3], target.shape[3])
+        H = min(pred.shape[2], target.shape[2])
+
+        # horizontal inter-block: x=1->x=2, x=3->x=4
+        # downsample rows by 2 (2x1 box) first so single-row diagonal edges cancel out
+        eh = (H // 2) * 2
+        p_h = (pred  [:, :, :eh, :W:1][:, :, 0::2, :] + pred  [:, :, :eh, :W:1][:, :, 1::2, :]) * 0.5
+        t_h = (target[:, :, :eh, :W:1][:, :, 0::2, :] + target[:, :, :eh, :W:1][:, :, 1::2, :]) * 0.5
+        n = (W - 1) // 2
+        pred_inter_h   = (p_h[:, :, :, 1::2][:, :, :, :n] - p_h[:, :, :, 2::2][:, :, :, :n]).abs()
+        target_inter_h = (t_h[:, :, :, 1::2][:, :, :, :n] - t_h[:, :, :, 2::2][:, :, :, :n]).abs()
+        loss_depix_h = ((pred_inter_h - target_inter_h).relu()).mean()
+
+        # vertical inter-block: y=1->y=2, y=3->y=4
+        # downsample cols by 2 (1x2 box) first so single-col diagonal edges cancel out
+        ew = (W // 2) * 2
+        p_v = (pred  [:, :, :H:1, :ew][:, :, :, 0::2] + pred  [:, :, :H:1, :ew][:, :, :, 1::2]) * 0.5
+        t_v = (target[:, :, :H:1, :ew][:, :, :, 0::2] + target[:, :, :H:1, :ew][:, :, :, 1::2]) * 0.5
+        m = (H - 1) // 2
+        pred_inter_v   = (p_v[:, :, 1::2, :][:, :, :m, :] - p_v[:, :, 2::2, :][:, :, :m, :]).abs()
+        target_inter_v = (t_v[:, :, 1::2, :][:, :, :m, :] - t_v[:, :, 2::2, :][:, :, :m, :]).abs()
+        loss_depix_v = ((pred_inter_v - target_inter_v).relu()).mean()
+
+        loss_depix = (loss_depix_h + loss_depix_v) * 0.5
+    else:
+        loss_depix = 0.0
+
+
+    # 6. Combine and Return
     return (loss_pixel * w_l1) + (loss_pixel_l2 * w_l2) \
-            + (total_neighborhood_loss * w_tex) + (loss_lowpass * w_l1_lowpass)
+            + (total_neighborhood_loss * w_tex) + (loss_lowpass * w_l1_lowpass) \
+            + (loss_depix * w_depix)
 
 loss_hd = neighborhood_dct_texture_loss
+
+# ── sinc downscale ────────────────────────────────────────────────────────────
+
+# Number of lobes for Lanczos sinc downscale used during LR generation.
+# 0 = always use box filter; >0 = 50% chance to use sinc instead of box.
+SINC_DOWNSCALE_LOBES: int = 3
+
+
+def _sinc_downscale2x(t: np.ndarray, lobes: int) -> np.ndarray:
+    """2× Lanczos-windowed sinc downscale. t: (C, H, W) float32 in [0,1]."""
+    C, H, W = t.shape
+    out_h, out_w = H // 2, W // 2
+
+    # Phase-matched to box filter: output pixel o centred at input 2*o + 0.5.
+    # 4*lobes taps; tap j is at input offset j, so distance from centre = j - (half - 0.5).
+    half = lobes * 2  # = 2*lobes
+    n_taps = 4 * lobes
+    j = np.arange(n_taps, dtype=np.float64)
+    d = j - (half - 0.5)
+    kern = np.sinc(d * 0.5) * np.sinc(d / (2.0 * lobes))
+    kern = (kern / kern.sum()).astype(np.float32)  # (n_taps,)
+
+    # Pad left by (half-1) so output pixel 0's first tap lands at padded index 0.
+    # Output pixel o's taps are at padded indices [2*o, 2*o + n_taps).
+    tw = np.pad(t, ((0,0),(0,0),(half-1, half)), mode='edge')  # (C, H, W + n_taps - 1)
+
+    # W pass: gather (C, H, out_w, n_taps) then sum → (C, H, out_w)
+    col_idx = 2 * np.arange(out_w)[:, None] + np.arange(n_taps)[None, :]  # (out_w, n_taps)
+    tmp = tw[:, :, col_idx]          # (C, H, out_w, n_taps)
+    tmp = (tmp * kern).sum(axis=3)   # (C, H, out_w)
+
+    # H pass: pad tmp along H, same gather pattern → (C, out_h, out_w)
+    tmp_pad = np.pad(tmp, ((0,0),(half-1, half),(0,0)), mode='edge')  # (C, H+n_taps-1, out_w)
+    row_idx = 2 * np.arange(out_h)[:, None] + np.arange(n_taps)[None, :]  # (out_h, n_taps)
+    tmp2 = tmp_pad[:, row_idx, :]    # (C, out_h, n_taps, out_w)
+    out = (tmp2 * kern[None, None, :, None]).sum(axis=2)  # (C, out_h, out_w)
+
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
 
 # ── augmentation helpers ──────────────────────────────────────────────────────
 
@@ -351,7 +437,10 @@ class UpscaleDataset:
         for _, hr_for_lr in blur_variants:
             key = id(hr_for_lr)
             if key not in precomputed:
-                lr = manual_downscale2x(hr_for_lr)
+                if SINC_DOWNSCALE_LOBES > 0 and random.random() < 0.5:
+                    lr = _sinc_downscale2x(hr_for_lr, SINC_DOWNSCALE_LOBES)
+                else:
+                    lr = manual_downscale2x(hr_for_lr)
                 # baseline_fn accepts numpy, returns numpy
                 baseline_fn = self.baseline_fn
                 if isinstance(lr, Tensor):
@@ -581,7 +670,7 @@ def train(args: argparse.Namespace):
     opt = AdamW(params, lr=args.lr, b1=0.9, b2=0.999, weight_decay=0.0)
     best_loss = float("inf")
 
-    use_basic_loss = args.basic_loss
+    use_basic_loss = not args.fancy_loss
 
     def _optstep():
         clip_grad_norm_(params, max_norm=1.0)
@@ -680,7 +769,7 @@ def main():
     p.add_argument("--lr",                type=float, default=2e-3)
     p.add_argument("--num-workers",       type=int,   default=4)
     p.add_argument("--leaky-slope",       type=float, default=0.003)
-    p.add_argument("--basic-loss",        action="store_true")
+    p.add_argument("--fancy-loss",        action="store_true")
     p.add_argument("--strict-validation", action="store_true")
     p.add_argument("--val-data",          default=None)
     args = p.parse_args()

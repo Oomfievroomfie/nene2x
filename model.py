@@ -16,8 +16,10 @@ Config string syntax
 Each comma-separated token is "KxK_C[d][n][q]":
   KxK   – square kernel size
   C     – number of output channels
-  d     – (optional suffix) depthwise convolution: each channel is convolved
-           independently (groups=in_channels).  e.g. "3x3_8d"
+  d     – (optional suffix) grouped convolution: if out_c >= in_c, depthwise
+           (groups=in_channels); if out_c < in_c, reverse-depthwise
+           (groups=out_channels, each output gets its own input subset).
+           e.g. "3x3_8d" (expand) or "3x3_20d" after 40 channels (reduce)
   n     – (optional suffix) no bias parameters
   q     – (optional suffix) dilated convolution (dilation = 2)
 
@@ -82,8 +84,13 @@ Global prefix "r," marks a *3-channel RGB* model.
 #gConfig = "g,3x3_16,3x3_24q,3x3_96d,1x1_24,3x3_28,3x3_52,3x3_4"
 #gConfig = "g,3x3_16,3x3_24q,3x3_96d,1x1_24,3x3_32,3x3_56,1x1_4"
 #gConfig = "g,3x3_16,3x3_48q,3x3_96d,1x1_38,3x3_38,3x3_56,3x3_96,1x1_4"
-#gConfig = "g,3x3_32,3x3_48q,3x3_96d,1x1_38,3x3_38,3x3_56,3x3_96,1x1_4"
-gConfig = "g,3x3_32,3x3_40q,3x3_48,3x3_96,3x3_40,1x1_4"
+#gConfig = "g,3x3_32,3x3_48q,3x3_96d,3x3_48d,3x3_56,3x3_96,1x1_4"
+#gConfig = "g,3x3_32,3x3_32q,3x3_40,3x3_48,3x3_480d,3x3_96d,3x3_40,1x1_4"
+#gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,3x3_16d,1x1_4"
+gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_320d,3x3_64d,1x1_4"
+#gConfig = "g,3x3_32,3x3_32q,3x3_48,3x3_96,3x3_40,1x1_4"
+
+# 9 25 49 81 121 169 225
 
 LEAKY_SLOPE = 0.00004
 
@@ -235,15 +242,20 @@ class UpscaleNet:
             if i == 0:
                 first_in_c = w.shape[1]
                 is_depthwise = False
+                prev_out_c = w.shape[0]
             else:
-                is_depthwise = (w.shape[1] == 1)
+                groups = prev_out_c // w.shape[1]
+                is_depthwise = (groups > 1)
+                prev_out_c = w.shape[0]
             no_bias = (pfx + ".bias") not in state
             specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
 
         w = state[final_key]
         if first_in_c is None:
             first_in_c = w.shape[1]
-        is_depthwise = (len(keys) > 0) and (w.shape[1] == 1)
+            prev_out_c = 0
+        groups = prev_out_c // w.shape[1] if prev_out_c else 1
+        is_depthwise = (len(keys) > 0) and (groups > 1)
         no_bias = (final_pfx + ".bias") not in state
         specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
         is_3ch = (first_in_c == 3)
@@ -254,7 +266,10 @@ class UpscaleNet:
         convs = []
         for k, out_c, is_depthwise, no_bias, *rest in specs:
             is_dilated = rest[0] if rest else False
-            groups = in_c if is_depthwise else 1
+            if is_depthwise:
+                groups = in_c if out_c >= in_c else out_c
+            else:
+                groups = 1
             dilation = 2 if is_dilated else 1
             convs.append(Conv2dManual(in_c, out_c, k, groups=groups,
                                       bias=not no_bias, is_wrapping=self.is_wrapping,
