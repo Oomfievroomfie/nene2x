@@ -87,7 +87,8 @@ Global prefix "r," marks a *3-channel RGB* model.
 #gConfig = "g,3x3_32,3x3_48q,3x3_96d,3x3_48d,3x3_56,3x3_96,1x1_4"
 #gConfig = "g,3x3_32,3x3_32q,3x3_40,3x3_48,3x3_480d,3x3_96d,3x3_40,1x1_4"
 #gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,3x3_16d,1x1_4"
-gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_320d,3x3_64d,1x1_4"
+#gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_320d,3x3_64d,1x1_4"
+gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
 #gConfig = "g,3x3_32,3x3_32q,3x3_48,3x3_96,3x3_40,1x1_4"
 
 # 9 25 49 81 121 169 225
@@ -166,8 +167,9 @@ class Conv2dManual:
     """Conv2d with manual replicate/circular padding. weight/bias exposed directly."""
 
     def __init__(self, in_c: int, out_c: int, k: int,
-                 groups: int = 1, bias: bool = True, is_wrapping: bool = False, dilation: int = 1):
+                 groups: int = 1, bias: bool = True, is_wrapping: bool = False, dilation: int = 1, stride: int = 1):
         self._k = k
+        self._stride = stride
         self._dilation = dilation
         self._pad_size = (k - 1) // 2 * dilation
         self.padding_enabled = True
@@ -196,7 +198,7 @@ class Conv2dManual:
             mode = "circular" if self.is_wrapping else "replicate"
             p = self._pad_size
             x = x.pad(((0, 0), (0, 0), (p, p), (p, p)), mode=mode)
-        return x.conv2d(self.weight, self.bias, groups=self.groups, dilation=self._dilation)
+        return x.conv2d(self.weight, self.bias, groups=self.groups, dilation=self._dilation, stride=self._stride)
 
 
 # ── model ─────────────────────────────────────────────────────────────────────
@@ -393,32 +395,32 @@ class UpscaleNet:
 
 class FilterNet:
     """
-    WGAN critic that operates on full reconstructed images (pred + baseline, or hr).
-    Standard WGAN critic: scores hr high and pred low. Generator loss uses softplus(-D(pred)),
-    which is large when pred scores low and shrinks toward zero as pred fools the critic.
-    Trained with a separate optimizer and weight clamping for Lipschitz constraint.
+    Critic that operates on full reconstructed images (pred + baseline, or hr).
+    Scores hr high and pred low. Generator loss uses softplus(-D(pred)),
+      which is large when pred scores low and shrinks toward zero as pred fools the critic.
     """
     def __init__(self, mid: int = 32):
         midh = (mid * 3) // 2
-        self.conv1 = Conv2dManual(1, 16, 3)
-        self.conv2 = Conv2dManual(16, 32, 3)
-        self.conv3 = Conv2dManual(32, 48, 3)
-        self.conv4 = Conv2dManual(48, 64, 3)
-        self.conv5 = Conv2dManual(64, 72, 3)
-        self.conv6 = Conv2dManual(72, 96, 3)
-        self.head  = Conv2dManual(96, 1, 1, bias=False)
+        self.conv1 = Conv2dManual(1, 24, 3)
+        #self.conv1 = Conv2dManual(1, 12, 3)
+        #self.conv2 = Conv2dManual(12, 24, 3, dilation=2)
+        #self.conv3 = Conv2dManual(24, 24, 3)
+        #self.conv4 = Conv2dManual(24, 48, 3, dilation=2)
+        #self.head  = Conv2dManual(48, 1, 1, stride=4, bias=False)
+        self.head  = Conv2dManual(24, 1, 1, stride=2, bias=False)
 
     def __call__(self, x: Tensor) -> Tensor:
-        x = self.conv1(x).leaky_relu(0.1)
-        x = self.conv2(x).leaky_relu(0.1)
-        x = self.conv3(x).leaky_relu(0.1)
-        x = self.conv4(x).leaky_relu(0.1)
-        x = self.conv5(x).leaky_relu(0.1)
-        x = self.conv6(x).leaky_relu(0.1)
+        #x = self.conv1(x).leaky_relu(0.1)
+        x = self.conv1(x).abs()
+        #x = self.conv2(x).leaky_relu(0.1)
+        #x = self.conv3(x).leaky_relu(0.1)
+        #x = self.conv4(x).leaky_relu(0.1)
         return self.head(x)
 
     def clamp_weights(self, c: float = 0.1):
         for attr in ("conv1", "conv2", "conv3", "conv4", "conv5", "conv6", "head"):
+            if not hasattr(self, attr):
+                continue
             cx = c
             if attr == "head":
                 cx *= 10.0

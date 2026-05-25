@@ -828,9 +828,7 @@ def train(args: argparse.Namespace):
 
     filter_params = list(get_state_dict(filter_net).values()) if filter_net is not None else []
     
-    # lr 1e-4: oscillation
-    # lr 1e-5: too slow
-    opt_filter = AdamW(filter_params, lr=1e-4, b1=0.5, b2=0.9, weight_decay=0.0) if filter_net is not None else None
+    opt_filter = AdamW(filter_params, lr=5e-6, b1=0.5, b2=0.9, weight_decay=1e-4) if filter_net is not None else None
 
     def _optstep():
         clip_grad_norm_(params, max_norm=1.0)
@@ -840,7 +838,7 @@ def train(args: argparse.Namespace):
 
     def _filter_optstep():
         opt_filter.step()
-        filter_net.clamp_weights(0.2)
+        #filter_net.clamp_weights(0.05)
 
     if use_adv_filter:
         @TinyJit
@@ -852,20 +850,20 @@ def train(args: argparse.Namespace):
             # filter_net grads from gen_loss are discarded by opt_filter.zero_grad() before disc step
             dc = hr_batch.mean(axis=(2, 3), keepdim=True)
             opt.zero_grad()
-            d_pred = filter_net(pred_full - dc)
-            gen_loss = 0.01 * (pred - res_batch).abs().mean() + 0.1 * (-d_pred).softplus().mean()
+            d_pred = filter_net(pred_full)
+            gen_loss = 0.7 * (pred - res_batch).abs().mean() + 0.1 * (-d_pred).softplus().mean() + 0.2 * loss_depix(pred_full, hr_batch)
             gen_loss.backward()
             _optstep()
 
-            # Discriminator step: WGAN critic minimizes D(pred)-D(hr), pushing pred negative and hr positive
+            # Discriminator step: non-saturating logistic (StyleGAN2), pushing pred negative and hr positive
             opt_filter.zero_grad()
-            d_pred_detached = filter_net((pred_full - dc).detach())
-            d_hr = filter_net(hr_batch - dc)
-            disc_loss = d_pred_detached.mean() - d_hr.mean() + d_pred_detached.relu().mean() + (-d_hr).relu().mean()
+            d_pred_detached = filter_net((pred_full).detach())
+            d_hr = filter_net(hr_batch)
+            disc_loss = d_pred_detached.softplus().mean() + (-d_hr).softplus().mean()
             disc_loss.backward()
             _filter_optstep()
 
-            return Tensor.stack(gen_loss, d_pred.mean(), d_hr.mean()).realize()
+            return Tensor.stack(gen_loss, (-d_pred).softplus().mean(), (-d_hr).softplus().mean()).realize()
     elif use_le_loss:
         @TinyJit
         def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
