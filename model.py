@@ -87,8 +87,8 @@ Global prefix "r," marks a *3-channel RGB* model.
 #gConfig = "g,3x3_32,3x3_48q,3x3_96d,3x3_48d,3x3_56,3x3_96,1x1_4"
 #gConfig = "g,3x3_32,3x3_32q,3x3_40,3x3_48,3x3_480d,3x3_96d,3x3_40,1x1_4"
 #gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,3x3_16d,1x1_4"
-#gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_320d,3x3_64d,1x1_4"
-gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
+gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_320d,3x3_64d,1x1_4"
+#gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
 #gConfig = "g,3x3_32,3x3_32q,3x3_48,3x3_96,3x3_40,1x1_4"
 
 # 9 25 49 81 121 169 225
@@ -395,39 +395,87 @@ class UpscaleNet:
 
 class FilterNet:
     """
-    Critic that operates on full reconstructed images (pred + baseline, or hr).
-    Scores hr high and pred low. Generator loss uses softplus(-D(pred)),
-      which is large when pred scores low and shrinks toward zero as pred fools the critic.
+    Learnable version of the fixed filter-bank texture loss.
+    Like the fixed filter bank: applies learned 3x3 filters to both pred and target,
+      takes abs of each response to get texture magnitudes, then compares them.
+
+    __call__(pred, target) -> scalar loss (pred_mag - target_mag).abs().mean()
     """
-    def __init__(self, mid: int = 32):
-        midh = (mid * 3) // 2
-        self.conv1 = Conv2dManual(1, 24, 3, bias=False)
-        #self.conv1 = Conv2dManual(1, 12, 3)
-        #self.conv2 = Conv2dManual(12, 24, 3, dilation=2)
-        #self.conv3 = Conv2dManual(24, 24, 3)
-        #self.conv4 = Conv2dManual(24, 48, 3, dilation=2)
-        #self.head  = Conv2dManual(48, 1, 1, stride=4, bias=False)
-        self.head  = Conv2dManual(24, 1, 1, stride=2, bias=False)
 
-    def __call__(self, x: Tensor) -> Tensor:
-        #x = self.conv1(x).leaky_relu(0.1)
-        x = self.conv1(x).abs()
-        #x = self.conv2(x).leaky_relu(0.1)
-        #x = self.conv3(x).leaky_relu(0.1)
-        #x = self.conv4(x).leaky_relu(0.1)
-        return self.head(x)
+    def _center_and_limit_weights(self, f):
+        f.weight = f.weight.clamp(-1.0, 1.0)
+        #f.weight = f.weight - f.weight.mean(axis=[1,2,3], keepdim=True)
+        #f.weight = f.weight / f.weight.square().sum(axis=[1,2,3], keepdim=True).sqrt().clamp(1e-8, float('inf'))
+        pass
 
-    def clamp_weights(self, c: float = 0.1):
-        for attr in ("conv1", "conv2", "conv3", "conv4", "conv5", "conv6", "head"):
-            if not hasattr(self, attr):
-                continue
-            cx = c
-            if attr == "head":
-                cx *= 10.0
-            conv = getattr(self, attr)
-            conv.weight = conv.weight.clamp(-cx, cx)
-            if conv.bias is not None:
-                conv.bias = conv.bias.clamp(-cx, cx)
+    def __init__(self):
+        self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=3)
+        self.filters2 = Conv2dManual(8, 16, 3, bias=False, stride=2)
+        self._center_and_limit_weights(self.filters )
+        self._center_and_limit_weights(self.filters2)
+
+    def normalize_filters(self):
+        self._center_and_limit_weights(self.filters )
+        self._center_and_limit_weights(self.filters2)
+        pass
+
+    def features(self, x: Tensor) -> Tensor:
+        x = self.filters(x).abs()
+        x = self.filters2(x).abs()
+        return x
+
+    def __call__(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred_f   = self.features(pred)  .avg_pool2d(kernel_size=(3, 3), stride=2)
+        target_f = self.features(target).avg_pool2d(kernel_size=(3, 3), stride=2)
+        diff = (pred_f - target_f).abs()
+        diff = diff * Tensor.rand(diff.shape) * 2.0
+        per_sample = Tensor.rand(diff.shape[0]).reshape(-1, 1, 1, 1) * 2.0
+        
+        #norm = (self.filters.weight.abs().sum() + self.filters2.weight.abs().sum()) / 16.0
+        norm = 1.0
+        return (diff * per_sample / norm).sum(axis=1).mean()
+
+
+class FilterNet2:
+    """
+        
+    """
+
+    def _limit_weights(self, f):
+        f.weight = f.weight.clamp(-1.0, 1.0)
+
+    def _center_weights(self, f):
+        f.weight = f.weight - f.weight.mean(axis=[1,2,3], keepdim=True)
+
+    def __init__(self):
+        self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=2)
+        self.filters2 = Conv2dManual(8, 24, 3, bias=False)
+        self.filters3 = Conv2dManual(24, 8, 3, bias=False, stride=2)
+        self._limit_weights(self.filters)
+        self._center_weights(self.filters)
+        self._limit_weights(self.filters2)
+        self._limit_weights(self.filters3)
+
+    def normalize_filters(self):
+        self._limit_weights(self.filters)
+        self._center_weights(self.filters)
+        self._limit_weights(self.filters2)
+        self._limit_weights(self.filters3)
+
+    def features(self, x: Tensor) -> Tensor:
+        x = self.filters(x).abs()
+        x = self.filters2(x).abs()
+        x = self.filters3(x).abs()
+        return x
+
+    def __call__(self, pred: Tensor) -> Tensor:
+        pred_f = self.features(pred).avg_pool2d(kernel_size=(3, 3), stride=2)
+        pred_f = pred_f * Tensor.rand(pred_f.shape) * 2.0
+        per_sample = Tensor.rand(pred_f.shape[0]).reshape(-1, 1, 1, 1) * 2.0
+        
+        norm = (self.filters.weight.abs().sum() + self.filters2.weight.abs().sum()) / 16.0
+        
+        return (pred_f * per_sample / norm).sum(axis=1).mean()
 
 
 # ── Sigma branch for ℓE loss ──────────────────────────────────────────────────
@@ -495,73 +543,45 @@ def manual_downscale2x(t):
 
 
 def box_blur5x5_np(t: np.ndarray, is_wrapping: bool = False) -> np.ndarray:
-    """5x5 box blur on (B, C, H, W) or (C, H, W) numpy float32. Respects wrapping."""
+    """Separable triangle blur (kernel [0.25, 0.5, 0.25]) on (B, C, H, W) or (C, H, W) float32."""
     batched = t.ndim == 4
     if not batched:
         t = t[np.newaxis]
     pad_mode = "wrap" if is_wrapping else "edge"
-    t_pad = np.pad(t, ((0,0),(0,0),(2,2),(2,2)), mode=pad_mode)
-    out = np.zeros_like(t, dtype=np.float32)
-    norm = 0.0
-    B, C, H, W = t.shape
-    #for dy in range(1, 4):
-    #    wy = 1.0 if dy == 2 else 0.5
-    #    for dx in range(1, 4):
-    #        wx = 1.0 if dx == 2 else 0.5
-    for dy in range(5):
-        #wy = 1.0 if dy == 2 else 0.7 if dy == 1 or dy == 3 else 0.2
-        #wy = 1.0 if dy == 2 else 1.0 if dy == 1 or dy == 3 else 0.5
-        wy = 1.0 if dy == 2 else 0.5 if dy == 1 or dy == 3 else 0.0
-        for dx in range(5):
-            #wx = 1.0 if dx == 2 else 0.7 if dx == 1 or dx == 3 else 0.2
-            #wx = 1.0 if dx == 2 else 1.0 if dx == 1 or dx == 3 else 0.5
-            wx = 1.0 if dx == 2 else 0.5 if dx == 1 or dx == 3 else 0.0
-            norm += wy*wx
-            out += t_pad[:, :, dy:dy+H, dx:dx+W] * wy*wx
-        
-    out *= (1.0 / norm)
-    return (out if batched else out[0]).astype(np.float32)
+    # H pass
+    t_pad = np.pad(t, ((0,0),(0,0),(1,1),(0,0)), mode=pad_mode)
+    t = t_pad[:, :, :-2, :] * 0.25 + t_pad[:, :, 1:-1, :] * 0.5 + t_pad[:, :, 2:, :] * 0.25
+    # W pass
+    t_pad = np.pad(t, ((0,0),(0,0),(0,0),(1,1)), mode=pad_mode)
+    t = t_pad[:, :, :, :-2] * 0.25 + t_pad[:, :, :, 1:-1] * 0.5 + t_pad[:, :, :, 2:] * 0.25
+    return (t if batched else t[0]).astype(np.float32)
 
 
 def upsample2x_np(t: np.ndarray, is_wrapping: bool = False) -> np.ndarray:
     """
     2x bilinear upsample. t: (B, C, H, W) or (C, H, W) numpy float32.
-    Returns same number of dims.
+    Pixel-center aligned: output pixel i samples input at (i+0.5)/2 - 0.5,
+    giving alternating weights 0.75/0.25 and 0.25/0.75 between neighbors.
+    Implemented as two separable passes (H then W).
     """
     batched = t.ndim == 4
     if not batched:
         t = t[np.newaxis]
     B, C, H, W = t.shape
     pad_mode = "wrap" if is_wrapping else "edge"
-    # Pad by 1
-    t_pad = np.pad(t, ((0,0),(0,0),(1,1),(1,1)), mode=pad_mode)
-    # 2x bilinear via pixel-center aligned interpolation
-    # For 2x: each output pixel at position (i,j) comes from input at (i+0.5)/2 - 0.5
-    # Simple: upsample then crop (matching the torch implementation)
-    H_pad, W_pad = H + 2, W + 2
-    out_H, out_W = H_pad * 2, W_pad * 2
-    # Bilinear interpolate t_pad to (B, C, out_H, out_W)
-    # Using numpy manual bilinear
-    ys = (np.arange(out_H, dtype=np.float32) + 0.5) / 2.0 - 0.5
-    xs = (np.arange(out_W, dtype=np.float32) + 0.5) / 2.0 - 0.5
-    ys = np.clip(ys, 0, H_pad - 1)
-    xs = np.clip(xs, 0, W_pad - 1)
-    y0 = np.floor(ys).astype(np.int32)
-    x0 = np.floor(xs).astype(np.int32)
-    y1 = np.minimum(y0 + 1, H_pad - 1)
-    x1 = np.minimum(x0 + 1, W_pad - 1)
-    ty = (ys - y0).astype(np.float32)
-    tx = (xs - x0).astype(np.float32)
-    # Gather
-    a = t_pad[:, :, y0[:, np.newaxis], x0[np.newaxis, :]]
-    b = t_pad[:, :, y0[:, np.newaxis], x1[np.newaxis, :]]
-    c = t_pad[:, :, y1[:, np.newaxis], x0[np.newaxis, :]]
-    d = t_pad[:, :, y1[:, np.newaxis], x1[np.newaxis, :]]
-    ty = ty[:, np.newaxis]
-    tx = tx[np.newaxis, :]
-    out_pad = (a * (1-ty)*(1-tx) + b * (1-ty)*tx
-             + c *    ty *(1-tx) + d *    ty *tx)
-    out = out_pad[:, :, 2:-2, 2:-2]
+
+    # H pass: (B, C, H, W) -> (B, C, 2H, W)
+    t_pad = np.pad(t, ((0,0),(0,0),(1,1),(0,0)), mode=pad_mode)  # (B, C, H+2, W)
+    out_h = np.empty((B, C, H * 2, W), dtype=np.float32)
+    out_h[:, :, 0::2, :] = t_pad[:, :, 1:-1, :] * 0.75 + t_pad[:, :, :-2,  :] * 0.25
+    out_h[:, :, 1::2, :] = t_pad[:, :, 1:-1, :] * 0.75 + t_pad[:, :, 2:,   :] * 0.25
+
+    # W pass: (B, C, 2H, W) -> (B, C, 2H, 2W)
+    t_pad = np.pad(out_h, ((0,0),(0,0),(0,0),(1,1)), mode=pad_mode)  # (B, C, 2H, W+2)
+    out = np.empty((B, C, H * 2, W * 2), dtype=np.float32)
+    out[:, :, :, 0::2] = t_pad[:, :, :, 1:-1] * 0.75 + t_pad[:, :, :, :-2 ] * 0.25
+    out[:, :, :, 1::2] = t_pad[:, :, :, 1:-1] * 0.75 + t_pad[:, :, :, 2:  ] * 0.25
+
     return (out if batched else out[0]).astype(np.float32)
 
 

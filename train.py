@@ -15,8 +15,9 @@ from tinygrad import Tensor, TinyJit
 from tinygrad.nn.optim import AdamW
 from tinygrad.nn.state import get_state_dict, safe_save, safe_load
 
-from model import (UpscaleNet, SigmaBranch, FilterNet, gaussian_blur,
-                   manual_downscale2x, upscale_edi_2x, upsample2x, box_blur5x5_np)
+from model import (UpscaleNet, SigmaBranch, FilterNet, FilterNet2, gaussian_blur,
+                   manual_downscale2x, upscale_edi_2x, upscale_edi_2x_np,
+                   upsample2x, upsample2x_np, box_blur5x5_np)
 
 
 # ── loss helpers ──────────────────────────────────────────────────────────────
@@ -196,6 +197,22 @@ def ntlfb():
 
 ntlfb_filter_bank = ntlfb()
 
+def triangle_blur(t: Tensor) -> Tensor:
+    out = t[:, :, 1:-1, 1:-1] * 0.0
+    out = out + t[:, :, :-2, :-2]   * (1.0/16.0)
+    out = out + t[:, :, :-2, 1:-1]  * (2.0/16.0)
+    out = out + t[:, :, :-2, 2:]    * (1.0/16.0)
+    out = out + t[:, :, 1:-1, :-2]  * (2.0/16.0)
+    out = out + t[:, :, 1:-1, 1:-1] * (4.0/16.0)
+    out = out + t[:, :, 1:-1, 2:]   * (2.0/16.0)
+    out = out + t[:, :, 2:, :-2]    * (1.0/16.0)
+    out = out + t[:, :, 2:, 1:-1]   * (2.0/16.0)
+    out = out + t[:, :, 2:, 2:]     * (1.0/16.0)
+    return out
+
+def lowpassed_l1_loss(pred: Tensor, target: Tensor) -> Tensor:
+    return (triangle_blur(pred) - triangle_blur(target)).abs().mean()
+
 def neighborhood_dct_texture_loss(
     pred: Tensor,
     target: Tensor,
@@ -237,23 +254,6 @@ def neighborhood_dct_texture_loss(
         
         return out
 
-    def apply_triangle_blur(t: Tensor) -> Tensor:
-        """Separable [0.25, 0.5, 0.25] 3x3 lowpass blur."""
-        out = t[:, :, 1:-1, 1:-1] * 0.0
-        
-        out = out + t[:, :, :-2, :-2]   * (1.0/16.0)
-        out = out + t[:, :, :-2, 1:-1]  * (2.0/16.0)
-        out = out + t[:, :, :-2, 2:]    * (1.0/16.0)
-        
-        out = out + t[:, :, 1:-1, :-2]  * (2.0/16.0)
-        out = out + t[:, :, 1:-1, 1:-1] * (4.0/16.0)
-        out = out + t[:, :, 1:-1, 2:]   * (2.0/16.0)
-        
-        out = out + t[:, :, 2:, :-2]    * (1.0/16.0)
-        out = out + t[:, :, 2:, 1:-1]   * (2.0/16.0)
-        out = out + t[:, :, 2:, 2:]     * (1.0/16.0)
-        
-        return out
 
     # =================================================================
     # 3. NEIGHBORHOOD TEXTURE LOSS (Per Filter)
@@ -299,9 +299,7 @@ def neighborhood_dct_texture_loss(
     # 4. LOWPASSED L1 LOSS
     # =================================================================
     if w_l1_lowpass > 0.0:
-        pred_blur = apply_triangle_blur(pred)
-        target_blur = apply_triangle_blur(target)
-        loss_lowpass = (pred_blur - target_blur).abs().mean()
+        loss_lowpass = lowpassed_l1_loss(pred, target)
     else:
         loss_lowpass = 0.0
     
@@ -342,9 +340,10 @@ def neighborhood_dct_texture_loss(
 
 
     # 6. Combine and Return
-    return (loss_pixel * w_l1) + (loss_pixel_l2 * w_l2) \
+    combined = (loss_pixel * w_l1) + (loss_pixel_l2 * w_l2) \
             + (total_neighborhood_loss * w_tex) + (loss_lowpass * w_l1_lowpass) \
             + (loss_depix * w_depix)
+    return combined, total_neighborhood_loss
 
 loss_hd = neighborhood_dct_texture_loss
 
@@ -372,17 +371,11 @@ def loss_depix(pred: Tensor, target: Tensor) -> Tensor:
 
     return (loss_h + loss_v) * 0.5
 
-def loss_adv_filter_upscaler(pred: Tensor, target: Tensor, filter_net: "FilterNet") -> Tensor:
-    """Generator-side loss: penalize pred by the adversarial filter score."""
-    diff = pred - target
-    return filter_net(diff).mean()
 
-
-def loss_adv_filter_discriminator(pred: Tensor, target: Tensor, filter_net: "FilterNet") -> Tensor:
-    """Discriminator-side loss: filter_net should score high on real errors.
-    Uses detached pred so gradients don't flow back to the upscaler."""
-    diff = pred.detach() - target
-    return -filter_net(diff).mean()
+def loss_adv_filter_disc(pred_full: Tensor, hr: Tensor, filter_net: "FilterNet") -> Tensor:
+    # we intentionally want the filter network to learn 0.1 or higher.
+    # the hardcoded texture scorer tends to get around 0.065ish after the generator learns enough.
+    return (filter_net(pred_full.detach(), hr) - 0.1).abs()
 
 
 # ── sinc downscale ────────────────────────────────────────────────────────────
@@ -428,12 +421,24 @@ def _sinc_downscale2x(t: np.ndarray, lobes: int) -> np.ndarray:
 
 def _orient(t: np.ndarray, rot: int, flip: bool) -> np.ndarray:
     """Apply one of 8 isometric orientations to a (C, H, W) numpy array."""
-    if flip:
-        t = t[:, :, ::-1].copy()
-    for _ in range(rot % 4):
-        # rot90 CCW: transpose then flip rows
-        t = np.transpose(t, (0, 2, 1))[:, ::-1, :].copy()
-    return t
+    # Each of the 8 cases resolves to at most one transpose + one copy with axis flips.
+    r = rot % 4
+    if r == 0:
+        if flip:
+            return t[:, :, ::-1].copy()
+        return t.copy()
+    elif r == 1:  # 90° CCW
+        if flip:
+            return np.transpose(t, (0, 2, 1))[:, :, ::-1].copy()
+        return np.transpose(t, (0, 2, 1))[:, ::-1, :].copy()
+    elif r == 2:  # 180°
+        if flip:
+            return t[:, ::-1, :].copy()
+        return t[:, ::-1, ::-1].copy()
+    else:         # 270° CCW
+        if flip:
+            return np.transpose(t, (0, 2, 1))[:, ::-1, :].copy()
+        return np.transpose(t, (0, 2, 1))[:, :, ::-1].copy()
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
@@ -516,7 +521,7 @@ class UpscaleDataset:
             lr = manual_downscale2x(hr)
         if isinstance(lr, Tensor):
             lr = lr.numpy()
-        baseline_out = self.baseline_fn(Tensor(lr))
+        baseline_out = self.baseline_fn(lr)
         if isinstance(baseline_out, Tensor):
             baseline_out = baseline_out.numpy()
 
@@ -530,15 +535,15 @@ class UpscaleDataset:
             if lH > ph + 2 * pad and lW > ph + 2 * pad:
                 ly = random.randint(pad, lH - ph - pad - 1)
                 lx = random.randint(pad, lW - ph - pad - 1)
-                lr_p  = lr          [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
+                lr_p   = lr          [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
                 base_p = baseline_out[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
-                hr_p  = hr          [:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
+                hr_p   = hr          [:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
             elif lH > ph and lW > ph:
                 ly = random.randint(0, lH - ph - 1)
                 lx = random.randint(0, lW - ph - 1)
-                lr_p  = lr          [:, ly : ly + ph,       lx : lx + ph      ]
+                lr_p   = lr          [:, ly : ly + ph,       lx : lx + ph      ]
                 base_p = baseline_out[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
-                hr_p  = hr          [:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
+                hr_p   = hr          [:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
             else:
                 lr_p   = lr
                 base_p = baseline_out
@@ -547,6 +552,12 @@ class UpscaleDataset:
             rot    = random.randint(0, 3)
             flip   = random.random() > 0.5
             brightness = random.uniform(0.5, 1.0) if random.random() > 0.5 else 1.0
+
+            if not self.is_3ch:
+                c = random.randrange(C)
+                lr_p   = lr_p  [c:c+1]
+                base_p = base_p[c:c+1]
+                hr_p   = hr_p  [c:c+1]
 
             a_lr   = _orient(lr_p,   rot, flip)
             a_base = _orient(base_p, rot, flip)
@@ -559,14 +570,7 @@ class UpscaleDataset:
 
             residual = a_hr - a_base
 
-            if not self.is_3ch:
-                c = random.randrange(C)
-                a_lr      = a_lr[c:c+1]
-                a_base    = a_base[c:c+1]
-                residual  = residual[c:c+1]
-                a_hr      = a_hr[c:c+1]
-
-            self.pairs.append((a_lr.astype(np.float16), residual.astype(np.float16), a_base.astype(np.float16), a_hr.astype(np.float16)))
+            self.pairs.append((a_lr, residual, a_base, a_hr))
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -678,8 +682,8 @@ def train(args: argparse.Namespace):
         print(f"Resumed weights from {args.resume}")
 
     filter_net = None
-    if args.adv_filter_loss:
-        filter_net = FilterNet()
+    if args.adv_filter_loss or args.adv_filter2_loss:
+        filter_net = FilterNet2() if args.adv_filter2_loss else FilterNet()
         if args.resume and Path(args.resume).exists():
             import shutil, tempfile, os
             fd, temp_path = tempfile.mkstemp(suffix=".safetensors")
@@ -763,11 +767,15 @@ def train(args: argparse.Namespace):
         def baseline_fn(t):
             arr = t.numpy() if isinstance(t, Tensor) else t
             blurred = box_blur5x5_np(arr[np.newaxis], is_wrapping=False)[0]
-            return upsample2x(blurred, is_wrapping=False)
+            return upsample2x_np(blurred, is_wrapping=False)
     elif net.is_bilinear:
-        baseline_fn = upsample2x
+        def baseline_fn(t):
+            arr = t.numpy() if isinstance(t, Tensor) else t
+            return upsample2x_np(arr, is_wrapping=False)
     else:
-        baseline_fn = upscale_edi_2x
+        def baseline_fn(t):
+            arr = t.numpy() if isinstance(t, Tensor) else t
+            return upscale_edi_2x_np(arr, is_wrapping=False)
     dataset = UpscaleDataset(
         args.data,
         patch_size=args.patch_size,
@@ -802,10 +810,10 @@ def train(args: argparse.Namespace):
     use_basic_loss = not args.fancy_loss
     use_le_loss = args.le_loss
     use_adv_filter = args.adv_filter_loss
+    use_adv_filter2 = args.adv_filter2_loss
 
     filter_params = list(get_state_dict(filter_net).values()) if filter_net is not None else []
-    
-    opt_filter = AdamW(filter_params, lr=1e-4, b1=0.5, b2=0.9, weight_decay=1e-4) if filter_net is not None else None
+    opt_filter = AdamW(filter_params, lr=1e-4, b1=0.5, b2=0.9, weight_decay=1e-6) if filter_net is not None else None
 
     def _optstep():
         clip_grad_norm_(params, max_norm=1.0)
@@ -815,7 +823,7 @@ def train(args: argparse.Namespace):
 
     def _filter_optstep():
         opt_filter.step()
-        #filter_net.clamp_weights(0.05)
+        filter_net.normalize_filters()
 
     if use_adv_filter:
         @TinyJit
@@ -823,24 +831,67 @@ def train(args: argparse.Namespace):
             pred = net(lr_batch)
             pred_full = pred + base_batch
 
-            # Generator step: softplus(-D(pred)) large when pred scores negative, near-zero when pred fools critic
-            # filter_net grads from gen_loss are discarded by opt_filter.zero_grad() before disc step
-            dc = hr_batch.mean(axis=(2, 3), keepdim=True)
+            # Generator step: minimize learned texture magnitude difference
             opt.zero_grad()
-            d_pred = filter_net(pred_full)
-            gen_loss = 0.7 * (pred - res_batch).abs().mean() + 0.1 * (-d_pred).softplus().mean() + 0.2 * loss_depix(pred_full, hr_batch)
+            
+            adv_loss = filter_net(pred, res_batch)
+            adv_val = filter_net(pred.detach(), res_batch).detach()
+            gt_val = filter_net(res_batch + Tensor.rand(res_batch.shape) * 0.1, res_batch)
+
+            loss_lowpass = lowpassed_l1_loss(pred_full, hr_batch)
+
+            gen_loss = (
+                  0.7 * adv_loss
+                + 0.2 * loss_depix(pred_full, hr_batch)
+                + 0.7 * (pred - res_batch).abs().mean()
+                + 0.5 * loss_lowpass)
+
             gen_loss.backward()
             _optstep()
 
-            # Discriminator step: non-saturating logistic (StyleGAN2), pushing pred negative and hr positive
+            # Discriminator step
             opt_filter.zero_grad()
-            d_pred_detached = filter_net((pred_full).detach())
-            d_hr = filter_net(hr_batch)
-            disc_loss = d_pred_detached.softplus().mean() + (-d_hr).softplus().mean()
+            
+            disc_loss = (filter_net(pred, res_batch) - 0.2).abs() + gt_val
             disc_loss.backward()
             _filter_optstep()
 
-            return Tensor.stack(gen_loss, (-d_pred).softplus().mean(), (-d_hr).softplus().mean()).realize()
+            return Tensor.stack(gen_loss, adv_val, gt_val).realize()
+    elif use_adv_filter2:
+        @TinyJit
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
+            pred = net(lr_batch)
+            pred_full = pred + base_batch
+
+            # Generator step: minimize learned texture variance
+            opt.zero_grad()
+            adv_loss = filter_net(pred_full)
+            adv_val = filter_net(pred_full.detach()).detach()
+            gt_val = filter_net(hr_batch.detach()).detach()
+
+            loss_lowpass = lowpassed_l1_loss(pred_full, hr_batch)
+
+            pred_down = pred_full.avg_pool2d(2)
+            hr_down = hr_batch.avg_pool2d(2)
+            loss_down = (pred_down - hr_down).abs().mean()
+
+            gen_loss = (
+                  0.5 * adv_loss
+                + 0.2 * loss_depix(pred_full, hr_batch)
+                + 0.7 * (pred - res_batch).abs().mean()
+                #+ 0.5 * loss_lowpass
+                + 1.4 * loss_down)
+
+            gen_loss.backward()
+            _optstep()
+
+            # Discriminator step
+            opt_filter.zero_grad()
+            disc_loss = (filter_net(pred_full.detach()) - 0.2).abs() + filter_net(hr_batch.detach())
+            disc_loss.backward()
+            _filter_optstep()
+
+            return Tensor.stack(gen_loss, adv_val, gt_val).realize()
     elif use_le_loss:
         @TinyJit
         def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
@@ -865,17 +916,20 @@ def train(args: argparse.Namespace):
         def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
             opt.zero_grad()
             pred = net(lr_batch)
-            loss = loss_hd(pred, res_batch)
+            loss, tex_val = loss_hd(pred, res_batch)
             loss.backward()
             _optstep()
-            return loss.realize()
+            return Tensor.stack(loss, tex_val).realize()
 
     chunk_size = max(1, len(dataset.pairs) // args.precompute_factor)
 
     for epoch in range(start_epoch, args.epochs + 1):
         new_lr = cosine_lr(epoch - 1, args.epochs, args.lr, args.lr * 0.1)
         opt.lr = Tensor([new_lr])
-
+        
+        #if opt_filter:    
+        #    opt_filter.lr = Tensor([new_lr * (1e-2 / args.lr)])
+        
         Tensor.training = True
 
         chunk_idx = (epoch - 1) % args.precompute_factor
@@ -887,7 +941,7 @@ def train(args: argparse.Namespace):
 
         running_loss = 0.0
         running_d_pred = 0.0
-        running_d_hr = 0.0
+        running_g_pred = 0.0
         steps = 0
 
         pbar = tqdm(range(0, len(indices) - args.batch_size + 1, args.batch_size),
@@ -911,11 +965,11 @@ def train(args: argparse.Namespace):
             z_batch    = Tensor(np.random.randn(*res_batch.shape).astype(np.float32))
 
             out = train_step(lr_batch, res_batch, base_batch, hr_batch, z_batch)
-            if use_adv_filter:
+            if use_adv_filter or use_adv_filter2 or (not use_basic_loss and not use_le_loss):
                 vals = out.numpy()
                 running_loss   += vals[0]
                 running_d_pred += vals[1]
-                running_d_hr   += vals[2]
+                running_g_pred += vals[2]
             else:
                 running_loss += out.numpy().item()
             steps += 1
@@ -924,9 +978,16 @@ def train(args: argparse.Namespace):
 
         filter_suffix = ""
         if use_adv_filter:
-            avg_d_pred = running_d_pred / max(steps, 1)
-            avg_d_hr   = running_d_hr   / max(steps, 1)
-            filter_suffix = f" | d_pred {avg_d_pred:.4f}  d_hr {avg_d_hr:.4f}"
+            avg_adv = running_d_pred / max(steps, 1)
+            avg_gt = running_g_pred / max(steps, 1)
+            filter_suffix = f" | adv {avg_adv:.4f} | gt {avg_gt:.4f}"
+        elif use_adv_filter2:
+            avg_adv = running_d_pred / max(steps, 1)
+            avg_gt = running_g_pred / max(steps, 1)
+            filter_suffix = f" | adv {avg_adv:.4f} | gt {avg_gt:.4f}"
+        elif not use_basic_loss and not use_le_loss:
+            avg_tex = running_d_pred / max(steps, 1)
+            filter_suffix = f" | tex {avg_tex:.4f}"
 
         if args.strict_validation:
             val_loss = run_validation(net, val_dataset, "cpu")
@@ -958,7 +1019,7 @@ def main():
     p.add_argument("--patch-size",        type=int,   default=64)
     p.add_argument("--n-aug",             type=int,   default=4)
     p.add_argument("--precompute-factor", type=int,   default=10)
-    p.add_argument("--patches-per-pair",  type=int,   default=20)
+    p.add_argument("--patches-per-pair",  type=int,   default=10)
     p.add_argument("--brightness-range",  type=float, default=0.15)
     p.add_argument("--lr",                type=float, default=2e-3)
     p.add_argument("--num-workers",       type=int,   default=4)
@@ -966,7 +1027,8 @@ def main():
     p.add_argument("--fancy-loss",        action="store_true")
     p.add_argument("--le-loss",           action="store_true", help="Use ℓE loss (arXiv:2201.10084)")
     p.add_argument("--le-beta",           type=float, default=0.01, help="Penalty factor β for σ auxiliary loss")
-    p.add_argument("--adv-filter-loss",   action="store_true", help="Use adversarial filter network loss")
+    p.add_argument("--adv-filter-loss",   action="store_true", help="Use adversarial FilterNet loss (two-arg, pred vs target)")
+    p.add_argument("--adv-filter2-loss",  action="store_true", help="Use adversarial FilterNet2 loss (single-arg, pred only)")
     p.add_argument("--strict-validation", action="store_true")
     p.add_argument("--val-data",          default=None)
     args = p.parse_args()
