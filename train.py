@@ -385,7 +385,7 @@ def loss_adv_filter_disc(pred_full: Tensor, hr: Tensor, filter_net: "FilterNet")
 SINC_DOWNSCALE_LOBES: int = 3
 
 
-def _sinc_downscale2x(t: np.ndarray, lobes: int) -> np.ndarray:
+def _sinc_downscale2x(t: np.ndarray, lobes: int, is_wrapping: bool = False) -> np.ndarray:
     """2× Lanczos-windowed sinc downscale. t: (C, H, W) float32 in [0,1]."""
     C, H, W = t.shape
     out_h, out_w = H // 2, W // 2
@@ -399,9 +399,11 @@ def _sinc_downscale2x(t: np.ndarray, lobes: int) -> np.ndarray:
     kern = np.sinc(d * 0.5) * np.sinc(d / (2.0 * lobes))
     kern = (kern / kern.sum()).astype(np.float32)  # (n_taps,)
 
+    pad_mode = "wrap" if is_wrapping else "edge"
+
     # Pad left by (half-1) so output pixel 0's first tap lands at padded index 0.
     # Output pixel o's taps are at padded indices [2*o, 2*o + n_taps).
-    tw = np.pad(t, ((0,0),(0,0),(half-1, half)), mode='edge')  # (C, H, W + n_taps - 1)
+    tw = np.pad(t, ((0,0),(0,0),(half-1, half)), mode=pad_mode)  # (C, H, W + n_taps - 1)
 
     # W pass: gather (C, H, out_w, n_taps) then sum → (C, H, out_w)
     col_idx = 2 * np.arange(out_w)[:, None] + np.arange(n_taps)[None, :]  # (out_w, n_taps)
@@ -409,7 +411,7 @@ def _sinc_downscale2x(t: np.ndarray, lobes: int) -> np.ndarray:
     tmp = (tmp * kern).sum(axis=3)   # (C, H, out_w)
 
     # H pass: pad tmp along H, same gather pattern → (C, out_h, out_w)
-    tmp_pad = np.pad(tmp, ((0,0),(half-1, half),(0,0)), mode='edge')  # (C, H+n_taps-1, out_w)
+    tmp_pad = np.pad(tmp, ((0,0),(half-1, half),(0,0)), mode=pad_mode)  # (C, H+n_taps-1, out_w)
     row_idx = 2 * np.arange(out_h)[:, None] + np.arange(n_taps)[None, :]  # (out_h, n_taps)
     tmp2 = tmp_pad[:, row_idx, :]    # (C, out_h, n_taps, out_w)
     out = (tmp2 * kern[None, None, :, None]).sum(axis=2)  # (C, out_h, out_w)
@@ -515,22 +517,28 @@ class UpscaleDataset:
         random.shuffle(self.pairs)
 
     def _add_image(self, hr: np.ndarray, n_aug: int, brightness_range: float):
-        if SINC_DOWNSCALE_LOBES > 0 and random.random() < 0.5:
-            lr = _sinc_downscale2x(hr, SINC_DOWNSCALE_LOBES)
-        else:
-            lr = manual_downscale2x(hr)
-        if isinstance(lr, Tensor):
-            lr = lr.numpy()
-        baseline_out = self.baseline_fn(lr)
-        if isinstance(baseline_out, Tensor):
-            baseline_out = baseline_out.numpy()
+        lr_box = manual_downscale2x(hr)
+        if isinstance(lr_box, Tensor):
+            lr_box = lr_box.numpy()
+        lr_sinc = _sinc_downscale2x(hr, SINC_DOWNSCALE_LOBES) if SINC_DOWNSCALE_LOBES > 0 else None
 
-        C, lH, lW = lr.shape
+        baseline_box = self.baseline_fn(lr_box)
+        if isinstance(baseline_box, Tensor):
+            baseline_box = baseline_box.numpy()
+        baseline_sinc = self.baseline_fn(lr_sinc) if lr_sinc is not None else None
+        if isinstance(baseline_sinc, Tensor):
+            baseline_sinc = baseline_sinc.numpy()
+
+        C, lH, lW = lr_box.shape
         ph  = self.patch_size
         pad = self.pad
 
         total_patches = n_aug * self.precompute_factor * self.patches_per_pair
         for _ in range(total_patches):
+            use_sinc = lr_sinc is not None and random.random() < 0.5
+            lr           = lr_sinc    if use_sinc else lr_box
+            baseline_out = baseline_sinc if use_sinc else baseline_box
+
             # crop a patch from the full-resolution arrays
             if lH > ph + 2 * pad and lW > ph + 2 * pad:
                 ly = random.randint(pad, lH - ph - pad - 1)
@@ -827,13 +835,13 @@ def train(args: argparse.Namespace):
 
     if use_adv_filter:
         @TinyJit
-        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
-            pred = net(lr_batch)
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor, noise_scale: Tensor) -> Tensor:
+            pred = net(lr_batch, noise_scale)
             pred_full = pred + base_batch
 
             # Generator step: minimize learned texture magnitude difference
             opt.zero_grad()
-            
+
             adv_loss = filter_net(pred, res_batch)
             adv_val = filter_net(pred.detach(), res_batch).detach()
             gt_val = filter_net(res_batch + Tensor.rand(res_batch.shape) * 0.1, res_batch)
@@ -851,7 +859,7 @@ def train(args: argparse.Namespace):
 
             # Discriminator step
             opt_filter.zero_grad()
-            
+
             disc_loss = (filter_net(pred, res_batch) - 0.2).abs() + gt_val
             disc_loss.backward()
             _filter_optstep()
@@ -859,8 +867,8 @@ def train(args: argparse.Namespace):
             return Tensor.stack(gen_loss, adv_val, gt_val).realize()
     elif use_adv_filter2:
         @TinyJit
-        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
-            pred = net(lr_batch)
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor, noise_scale: Tensor) -> Tensor:
+            pred = net(lr_batch, noise_scale)
             pred_full = pred + base_batch
 
             # Generator step: minimize learned texture variance
@@ -869,16 +877,19 @@ def train(args: argparse.Namespace):
             adv_val = filter_net(pred_full.detach()).detach()
             gt_val = filter_net(hr_batch.detach()).detach()
 
-            loss_lowpass = lowpassed_l1_loss(pred_full, hr_batch)
+            #loss_lowpass = lowpassed_l1_loss(pred_full, hr_batch)
 
             pred_down = pred_full.avg_pool2d(2)
             hr_down = hr_batch.avg_pool2d(2)
             loss_down = (pred_down - hr_down).abs().mean()
+            loss_l1 = (pred - res_batch).abs().mean()
+            #loss_l2 = (pred - res_batch).abs().mean()
 
             gen_loss = (
-                  0.5 * adv_loss
+                  0.7 * adv_loss
                 + 0.2 * loss_depix(pred_full, hr_batch)
-                + 0.7 * (pred - res_batch).abs().mean()
+                + 0.5 * loss_l1
+                #+ 0.5 * loss_l1
                 #+ 0.5 * loss_lowpass
                 + 1.4 * loss_down)
 
@@ -894,9 +905,9 @@ def train(args: argparse.Namespace):
             return Tensor.stack(gen_loss, adv_val, gt_val).realize()
     elif use_le_loss:
         @TinyJit
-        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor, noise_scale: Tensor) -> Tensor:
             opt.zero_grad()
-            pred, feats = net.forward_with_features(lr_batch)
+            pred, feats = net.forward_with_features(lr_batch, noise_scale)
             sigma = sigma_branch(feats)
             loss = loss_lE(pred, res_batch, sigma=sigma, beta=args.le_beta)
             loss.backward()
@@ -904,24 +915,27 @@ def train(args: argparse.Namespace):
             return loss.realize()
     elif use_basic_loss:
         @TinyJit
-        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor, noise_scale: Tensor) -> Tensor:
             opt.zero_grad()
-            pred = net(lr_batch)
+            pred = net(lr_batch, noise_scale)
             loss = loss_l1(pred, res_batch)
             loss.backward()
             _optstep()
             return loss.realize()
     else:
         @TinyJit
-        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor) -> Tensor:
+        def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor, noise_scale: Tensor) -> Tensor:
             opt.zero_grad()
-            pred = net(lr_batch)
+            pred = net(lr_batch, noise_scale)
             loss, tex_val = loss_hd(pred, res_batch)
             loss.backward()
             _optstep()
             return Tensor.stack(loss, tex_val).realize()
 
     chunk_size = max(1, len(dataset.pairs) // args.precompute_factor)
+
+    global_batch = 0
+    noise_warmup_batches = 60
 
     for epoch in range(start_epoch, args.epochs + 1):
         new_lr = cosine_lr(epoch - 1, args.epochs, args.lr, args.lr * 0.1)
@@ -964,12 +978,19 @@ def train(args: argparse.Namespace):
             hr_batch   = Tensor(np.stack(hr_list,   axis=0).astype(np.float32))
             z_batch    = Tensor(np.random.randn(*res_batch.shape).astype(np.float32))
 
-            out = train_step(lr_batch, res_batch, base_batch, hr_batch, z_batch)
-            if use_adv_filter or use_adv_filter2 or (not use_basic_loss and not use_le_loss):
+            noise_scale = Tensor([min(1.0, global_batch / noise_warmup_batches)])
+            global_batch += 1
+
+            out = train_step(lr_batch, res_batch, base_batch, hr_batch, z_batch, noise_scale)
+            if use_adv_filter or use_adv_filter2:
                 vals = out.numpy()
                 running_loss   += vals[0]
                 running_d_pred += vals[1]
                 running_g_pred += vals[2]
+            elif not use_basic_loss and not use_le_loss:
+                vals = out.numpy()
+                running_loss   += vals[0]
+                running_d_pred += vals[1]
             else:
                 running_loss += out.numpy().item()
             steps += 1
@@ -1003,6 +1024,44 @@ def train(args: argparse.Namespace):
     print("Training complete.")
 
 
+# ── sinc downscale helper ─────────────────────────────────────────────────────
+
+def sinc_downscale_file(args: argparse.Namespace):
+    src = Path(args.input)
+    if args.output:
+        dst = Path(args.output)
+    else:
+        dst = src.with_stem(src.stem + "_sinc_half")
+
+    img = Image.open(src)
+    if img.mode == "P":
+        img = img.convert("RGBA" if "transparency" in img.info else "RGB")
+    elif img.mode not in ("L", "RGB", "RGBA", "LA"):
+        img = img.convert("RGB")
+
+    original_mode = img.mode
+    arr = np.asarray(img).astype(np.float32)
+    if arr.dtype == np.uint16:
+        arr = arr / 65535.0
+    else:
+        arr = arr / 255.0
+
+    if arr.ndim == 2:
+        arr = arr[:, :, np.newaxis]
+
+    chw = arr.transpose(2, 0, 1)  # (C, H, W)
+    out = _sinc_downscale2x(chw, args.lobes, is_wrapping=args.wrap)
+    out_hwc = np.clip(out.transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)
+
+    if out_hwc.shape[2] == 1:
+        result = Image.fromarray(out_hwc[:, :, 0], mode="L")
+    else:
+        result = Image.fromarray(out_hwc, mode=original_mode)
+
+    result.save(dst)
+    print(f"Saved {dst}  ({img.width}x{img.height} -> {result.width}x{result.height})")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1010,29 +1069,52 @@ def main():
     os.environ["OMP_NUM_THREADS"] = "4"
     os.environ["MKL_NUM_THREADS"] = "4"
 
-    p = argparse.ArgumentParser(description="Train 2× per-channel image upscaler")
-    p.add_argument("data",           help="Folder of high-resolution training images")
-    p.add_argument("--out",          default="upscaler.safetensors")
-    p.add_argument("--resume",       default=None)
-    p.add_argument("--epochs",            type=int,   default=700)
-    p.add_argument("--batch-size",        type=int,   default=32)
-    p.add_argument("--patch-size",        type=int,   default=64)
-    p.add_argument("--n-aug",             type=int,   default=4)
-    p.add_argument("--precompute-factor", type=int,   default=10)
-    p.add_argument("--patches-per-pair",  type=int,   default=10)
-    p.add_argument("--brightness-range",  type=float, default=0.15)
-    p.add_argument("--lr",                type=float, default=2e-3)
-    p.add_argument("--num-workers",       type=int,   default=4)
-    p.add_argument("--leaky-slope",       type=float, default=0.003)
-    p.add_argument("--fancy-loss",        action="store_true")
-    p.add_argument("--le-loss",           action="store_true", help="Use ℓE loss (arXiv:2201.10084)")
-    p.add_argument("--le-beta",           type=float, default=0.01, help="Penalty factor β for σ auxiliary loss")
-    p.add_argument("--adv-filter-loss",   action="store_true", help="Use adversarial FilterNet loss (two-arg, pred vs target)")
-    p.add_argument("--adv-filter2-loss",  action="store_true", help="Use adversarial FilterNet2 loss (single-arg, pred only)")
-    p.add_argument("--strict-validation", action="store_true")
-    p.add_argument("--val-data",          default=None)
-    args = p.parse_args()
-    train(args)
+    top = argparse.ArgumentParser(description="Train 2× per-channel image upscaler")
+    sub = top.add_subparsers(dest="command")
+
+    # ── sinc-downscale subcommand ──────────────────────────────────────────────
+    sd = sub.add_parser("sinc-downscale", help="2× sinc downscale a single image file")
+    sd.add_argument("input",              help="Input image path")
+    sd.add_argument("--output",           default=None, help="Output path (default: <input>_sinc_half.<ext>)")
+    sd.add_argument("--lobes",  type=int, default=SINC_DOWNSCALE_LOBES, help="Lanczos lobe count")
+    sd.add_argument("--wrap",   action="store_true", help="Wrap edges instead of clamping")
+
+    # ── train subcommand (also the legacy default) ─────────────────────────────
+    tr = sub.add_parser("train", help="Train the upscaler (default when no subcommand given)")
+    tr.add_argument("data",           help="Folder of high-resolution training images")
+    tr.add_argument("--out",          default="upscaler.safetensors")
+    tr.add_argument("--resume",       default=None)
+    tr.add_argument("--epochs",            type=int,   default=700)
+    tr.add_argument("--batch-size",        type=int,   default=32)
+    tr.add_argument("--patch-size",        type=int,   default=64)
+    tr.add_argument("--n-aug",             type=int,   default=4)
+    tr.add_argument("--precompute-factor", type=int,   default=10)
+    tr.add_argument("--patches-per-pair",  type=int,   default=10)
+    tr.add_argument("--brightness-range",  type=float, default=0.15)
+    tr.add_argument("--lr",                type=float, default=2e-3)
+    tr.add_argument("--num-workers",       type=int,   default=4)
+    tr.add_argument("--leaky-slope",       type=float, default=0.003)
+    tr.add_argument("--fancy-loss",        action="store_true")
+    tr.add_argument("--le-loss",           action="store_true", help="Use ℓE loss (arXiv:2201.10084)")
+    tr.add_argument("--le-beta",           type=float, default=0.01, help="Penalty factor β for σ auxiliary loss")
+    tr.add_argument("--adv-filter-loss",   action="store_true", help="Use adversarial FilterNet loss (two-arg, pred vs target)")
+    tr.add_argument("--adv-filter2-loss",  action="store_true", help="Use adversarial FilterNet2 loss (single-arg, pred only)")
+    tr.add_argument("--strict-validation", action="store_true")
+    tr.add_argument("--val-data",          default=None)
+
+    # Legacy: if first arg isn't a known subcommand, treat the whole invocation
+    # as a bare "train" call so existing scripts keep working.
+    import sys
+    argv = sys.argv[1:]
+    if argv and argv[0] not in ("sinc-downscale", "train", "-h", "--help"):
+        argv = ["train"] + argv
+
+    args = top.parse_args(argv)
+
+    if args.command == "sinc-downscale":
+        sinc_downscale_file(args)
+    else:
+        train(args)
 
 
 if __name__ == "__main__":

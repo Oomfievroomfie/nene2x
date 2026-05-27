@@ -37,8 +37,7 @@ def load_model(weights_path: str, do_wrap: bool = True) -> UpscaleNet:
               for conv in [*model.layers, model._final_layer]
               if conv._k > 1)
     model.infer_pad = pad
-    if pad > 0:
-        model.set_padding_enabled(False)
+    model.set_padding_enabled(False)
 
     from tinygrad.nn.state import get_state_dict
     total_params = sum(p.numpy().size for p in get_state_dict(model).values())
@@ -195,6 +194,7 @@ def upscale_image(model: UpscaleNet,
     global timesum
     import time
 
+    noise_scale = Tensor([1.0])
     tensor, mode = _to_float(img)  # numpy (C, H, W)
 
     if yonly:
@@ -217,7 +217,7 @@ def upscale_image(model: UpscaleNet,
             else:
                 rgb_in = rgb3
             ch_t = Tensor(rgb_in.astype(np.float32))
-            result = model.upscale_channel(ch_t).numpy()  # (3, 2H, 2W)
+            result = model.upscale_channel(ch_t, noise_scale).numpy()  # (3, 2H, 2W)
         else:
             stride       = tile_size
             out_H, out_W = H * 2, W * 2
@@ -225,32 +225,25 @@ def upscale_image(model: UpscaleNet,
             result       = np.zeros((3, out_H + off, out_W + off), dtype=np.float32)
 
             ph = pad + stride
-            total_h = H + ph + pad
-            total_w = W + ph + pad
-            if pad_mode == "wrap" and (ph >= H or pad >= W or stride >= W):
-                ys = np.arange(total_h) % H
-                xs = np.arange(total_w) % W
+            total_h = H + ph + ph
+            total_w = W + ph + ph
+            if pad_mode == "wrap" and (ph >= H or ph >= W or stride >= W):
+                ys = (np.arange(total_h) - ph) % H
+                xs = (np.arange(total_w) - ph) % W
                 tensor_pad = rgb3[:, ys][:, :, xs]
             else:
-                tensor_pad = np.pad(rgb3, ((0,0),(ph,pad),(ph,pad)), mode=pad_mode)
+                tensor_pad = np.pad(rgb3, ((0,0),(ph,ph),(ph,ph)), mode=pad_mode)
 
-            full_tile_h = stride + 2 * pad
-            full_tile_w = stride + 2 * pad
             for y0 in range(0, H, stride):
                 y1 = min(y0 + stride, H)
                 for x0 in range(0, W, stride):
                     x1 = min(x0 + stride, W)
                     tile = tensor_pad[:, y0+stride : y1+stride+2*pad,
                                          x0+stride : x1+stride+2*pad]
-                    th, tw = tile.shape[1], tile.shape[2]
-                    if th < full_tile_h or tw < full_tile_w:
-                        tile = np.pad(tile,
-                                      ((0,0),(0, full_tile_h-th),(0, full_tile_w-tw)),
-                                      mode="edge")
                     out_h, out_w = (y1 - y0) * 2, (x1 - x0) * 2
-                    ch_t = Tensor(tile.astype(np.float32))
+                    ch_t = Tensor(tile)
                     result[:, y0*2+off : y1*2+off, x0*2+off : x1*2+off] = \
-                        model.upscale_channel(ch_t).numpy()[:, :out_h, :out_w]
+                        model.upscale_channel(ch_t, noise_scale).numpy()[:, :out_h, :out_w]
 
             result = result[:, off:off+out_H, off:off+out_W]
 
@@ -270,7 +263,7 @@ def upscale_image(model: UpscaleNet,
                     channels.append(_bilinear_upsample_2x(tensor[c]))
                 else:
                     ch_t = Tensor(tensor_in[c].astype(np.float32))
-                    channels.append(model.upscale_channel(ch_t).numpy())
+                    channels.append(model.upscale_channel(ch_t, noise_scale).numpy())
             result = np.stack(channels, axis=0)  # (C, 2H, 2W)
         else:
             stride       = tile_size
@@ -282,8 +275,8 @@ def upscale_image(model: UpscaleNet,
             total_h = H + ph + pad
             total_w = W + ph + pad
             if pad_mode == "wrap" and (ph >= H or pad >= W or stride >= W):
-                ys = np.arange(total_h) % H  # simplified
-                xs = np.arange(total_w) % W
+                ys = (np.arange(total_h) - ph) % H
+                xs = (np.arange(total_w) - ph) % W
                 tensor_pad = tensor[:, ys][:, :, xs]
             else:
                 tensor_pad = np.pad(tensor, ((0,0),(ph,pad),(ph,pad)), mode=pad_mode)
@@ -306,7 +299,7 @@ def upscale_image(model: UpscaleNet,
                     for c in net_chans:
                         ch_t = Tensor(tile[c].astype(np.float32))
                         result[c, y0*2+off : y1*2+off, x0*2+off : x1*2+off] = \
-                            model.upscale_channel(ch_t).numpy()[:out_h, :out_w]
+                            model.upscale_channel(ch_t, noise_scale).numpy()[:out_h, :out_w]
 
             result = result[:, off:off+out_H, off:off+out_W]
 
@@ -352,6 +345,8 @@ def process(args: argparse.Namespace):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     Tensor.training = False
+    Tensor.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     for path in tqdm(paths, desc="Upscaling"):
         try:
@@ -405,6 +400,7 @@ def main():
     p.add_argument("--yonly", action="store_true")
     p.add_argument("--gridline-removal", action="store_true")
     p.add_argument("--leaky-slope", type=float, default=0.0)
+    p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
     process(args)
 

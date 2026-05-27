@@ -4,11 +4,9 @@ Super small 2x upscaling neural network.
 
 General architecture: simple ReLU convolutional neural network that upscales an image by 2x. Works as a cleanup pass for bilinear: the network gives you 4 values per input pixel, you use them to push around the 4 pixels produced by bilinear.
 
-This is a **single-channel upscaler**. For RGB, my recommendation is to **upscale only the luma channel**, i.e. give it a greyscale input and add the output to every single channel.
+This is a **single-channel upscaler**. For RGB, my recommendation is to upscale the image in YCgCo instead of RGB.
 
-The model architecture is designed to be extremely easy to integrate into any existing project that has a post-processing framework capable of handling *any* upscaler. The model runs once per input pixel and produces a set of residuals instead of a single residual.
-
-**Important note**: On linux or nvidia, edit `pyproject.toml` to refer to `torch>=2.4.0` instead of `torch-directml`. I'm on windows+AMD, so I have to use `torch-directml`, and I don't know how to make it pick what or what else based on runtime hardware support.
+The model architecture is designed to be extremely easy to integrate into any existing project that has a post-processing framework capable of handling *any* upscaler. The smallest models runs once per input pixel and produces a set of residuals instead of a single residual.
 
 ## I just want to upscale an image
 
@@ -58,17 +56,17 @@ Run `glsl.py` on one of the networks in `pretrained/` to get a set of GLSL funct
 
 ## Training
 
-Modify `model.py` directly to set the network architecture before training. There's a `gConfig` variable with old configs and my notes on them. Training data is in `train/`, and the images in this repo are the ones I actually used to train the pretrained models. Trains in 10~25 minutes on an RX 6800 depending on network size.
+Modify `model.py` directly to set the network architecture before training. There's a `gConfig` variable with old configs listed. Training data is in `train_authentic/`, and the images in this repo are the ones I actually used to train the pretrained models. Trains in 10~25 minutes on an RX 6800 depending on network size.
 
-`uv run python train.py train/ --epochs 700`
+`uv run python train.py train_authentic/ --epochs 700`
 
-**NOTE:** Some network geometries are extremely prone to breaking (getting trapped in bad local minima) on unlucky initializations, such that they fail to stop producing some artifacts during training. Either babysit them for the first 100 epochs, checking their output to make sure they aren't going to break, or wrap training in a harness that trains multiple copies of them (at least 4) and picks the best one based on PSNR tests (if you need that harness, build it yourself). Training is done with Leaky ReLUs instead of pure ReLUs to make this problem less common, but it can still happen for extremely small network configurations.
+**NOTE:** Some very small network geometries are extremely prone to breaking (getting trapped in bad local minima) on unlucky initializations, such that they fail to stop producing some artifacts during training. For such networks, use `train_until_good.py` to get them started, then resume them with the main training script and `--resume`. Training is done with Leaky ReLUs instead of pure ReLUs to make this problem less common, but it can still happen for extremely small network configurations.
 
 If gridlines or checkerboards appear on certain colors of flat surface after training, don't throw the model away. Instead, `--resume` a copy of it with a very low learning rate like `--lr 0.001` for a few epochs. If the artifacts still appear, try again. If they still appear, try a higher or lower learning rate.
 
 ## Results
 
-TODO: automatically take PSNR readings and compare to "waifu2x" (cunet) and "Convolutional upscaling Neural Network, yeah!"
+TODO: automatically take PSNR readings and compare to waifu2x and "Convolutional upscaling Neural Network, yeah!"
 
 ## LLM Usage & Copyright
 
@@ -86,4 +84,4 @@ All code and model data in this repo is licensed under your choice of:
 - BSD-0
 - Unlicense
 
-The images under `train/` are provided for training and may be freely redistributed for that purpose, including heavily transformed versions of them. Any model data produced by training on them belongs to you.
+The training images are provided for training and may be freely redistributed for that purpose, including heavily transformed versions of them. Any model data produced by training on them belongs to you. The photos in particular are CC0.

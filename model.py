@@ -13,7 +13,7 @@ Outputs are the RESIDUAL above EDI or bilinear interpolation, not raw pixel valu
 
 Config string syntax
 ────────────────────
-Each comma-separated token is "KxK_C[d][n][q]":
+Each comma-separated token is "KxK_C[d][n][q][w]":
   KxK   – square kernel size
   C     – number of output channels
   d     – (optional suffix) grouped convolution: if out_c >= in_c, depthwise
@@ -22,6 +22,9 @@ Each comma-separated token is "KxK_C[d][n][q]":
            e.g. "3x3_8d" (expand) or "3x3_20d" after 40 channels (reduce)
   n     – (optional suffix) no bias parameters
   q     – (optional suffix) dilated convolution (dilation = 2)
+  w     – (optional suffix) add noise to this layer's output activations.
+           e.g. "3x3_32w" adds noise to all 32 output channels after activation.
+           Useful near the end of the network to help reconstruct high-frequency detail.
 
 Global prefix "b," (before the first token) marks a *bilinear-base* model.
   • The base upscale uses plain bilinear filtering (upsample2x) instead of EDI.
@@ -87,8 +90,10 @@ Global prefix "r," marks a *3-channel RGB* model.
 #gConfig = "g,3x3_32,3x3_48q,3x3_96d,3x3_48d,3x3_56,3x3_96,1x1_4"
 #gConfig = "g,3x3_32,3x3_32q,3x3_40,3x3_48,3x3_480d,3x3_96d,3x3_40,1x1_4"
 #gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,3x3_16d,1x1_4"
-gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_320d,3x3_64d,1x1_4"
+#gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_320d,3x3_64d,1x1_4"
 #gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
+#gConfig = "g,3x3_24,3x3_32,3x3_48,3x3_64,3x3_96,3x3_16d,1x1_4"
+gConfig = "g,3x3_24,3x3_32,3x3_40,3x3_48,3x3_128,1x1_4"
 #gConfig = "g,3x3_32,3x3_32q,3x3_48,3x3_96,3x3_40,1x1_4"
 
 # 9 25 49 81 121 169 225
@@ -135,20 +140,20 @@ def _parse_config(cfg: str) -> tuple:
     for token in cfg.split(","):
         token = token.strip()
         flags = set()
-        while token[-1] in ("d", "n", "q"):
+        while token[-1] in ("d", "n", "q", "w"):
             flags.add(token[-1])
             token = token[:-1]
         kpart, c_str = token.split("_")
         k = int(kpart.split("x")[0])
-        specs.append((k, int(c_str), "d" in flags, "n" in flags, "q" in flags))
+        specs.append((k, int(c_str), "d" in flags, "n" in flags, "q" in flags, "w" in flags))
     expected_out = 12 if is_3ch else 4
     assert specs[-1][1] == expected_out, f"Final layer must output {expected_out} channels, got {specs[-1][1]}"
     return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch
 
 
 def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False, is_raw: bool = False, is_3ch: bool = False) -> str:
-    def _token(k, c, dw, nb, dil=False):
-        return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}{'q' if dil else ''}"
+    def _token(k, c, dw, nb, dil=False, noise=False):
+        return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}{'q' if dil else ''}{'w' if noise else ''}"
     body = ",".join(_token(*s) for s in specs)
     if is_blurbilinear:
         body = "g," + body
@@ -238,46 +243,59 @@ class UpscaleNet:
         keys = sorted(k for k in state if k.startswith("layers.") and k.endswith(".weight"))
         specs = []
         first_in_c = None
+        prev_out_c = 0
         for i, k in enumerate(keys):
             w = state[k]
             pfx = k[:-len(".weight")]
+            actual_in_c = w.shape[1]  # in_c per group
             if i == 0:
-                first_in_c = w.shape[1]
+                first_in_c = actual_in_c
                 is_depthwise = False
                 prev_out_c = w.shape[0]
             else:
-                groups = prev_out_c // w.shape[1]
-                is_depthwise = (groups > 1)
+                expected_in_c = prev_out_c
+                groups_if_dw = expected_in_c // actual_in_c if actual_in_c <= expected_in_c else 1
+                is_depthwise = (groups_if_dw > 1)
                 prev_out_c = w.shape[0]
             no_bias = (pfx + ".bias") not in state
-            specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
+            specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias, False, False))
 
         w = state[final_key]
         if first_in_c is None:
             first_in_c = w.shape[1]
             prev_out_c = 0
-        groups = prev_out_c // w.shape[1] if prev_out_c else 1
-        is_depthwise = (len(keys) > 0) and (groups > 1)
+        actual_in_c = w.shape[1]
+        expected_in_c = prev_out_c
+        if prev_out_c > 0:
+            groups_if_dw = expected_in_c // actual_in_c if actual_in_c <= expected_in_c else 1
+            is_depthwise = (len(keys) > 0) and (groups_if_dw > 1)
+        else:
+            is_depthwise = False
         no_bias = (final_pfx + ".bias") not in state
-        specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias))
+        specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias, False, False))
         is_3ch = (first_in_c == 3)
         return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch
 
     def _build_layers(self, specs: list):
         in_c = 3 if self.is_3ch else 1
         convs = []
+        noise_flags = []
         for k, out_c, is_depthwise, no_bias, *rest in specs:
             is_dilated = rest[0] if rest else False
+            has_noise = bool(rest[1]) if len(rest) > 1 else False
             if is_depthwise:
                 groups = in_c if out_c >= in_c else out_c
             else:
                 groups = 1
             dilation = 2 if is_dilated else 1
-            convs.append(Conv2dManual(in_c, out_c, k, groups=groups,
-                                      bias=not no_bias, is_wrapping=self.is_wrapping,
-                                      dilation=dilation))
+            conv = Conv2dManual(in_c, out_c, k, groups=groups,
+                                bias=not no_bias, is_wrapping=self.is_wrapping,
+                                dilation=dilation)
+            convs.append(conv)
+            noise_flags.append(has_noise)
             in_c = out_c
         self.layers = convs[:-1]
+        self._layer_noise = noise_flags[:-1]
         final_attr = "zfinal"
         if self.is_bilinear:
             final_attr = "zfinalb"
@@ -336,48 +354,55 @@ class UpscaleNet:
             if conv._k > 1:
                 conv.padding_enabled = enabled
 
-    def __call__(self, x: Tensor, return_features: bool = False) -> Tensor:
-        for conv in self.layers:
-            x = conv(x).leaky_relu(LEAKY_SLOPE)
-        if return_features:
-            return x
+    def __call__(self, x: Tensor, noise_scale: Tensor = None) -> Tensor:
+        for conv, has_noise in zip(self.layers, self._layer_noise):
+            x = conv(x)
+            if has_noise:
+                x = x * (1.0 + Tensor.randn(*x.shape) * noise_scale * 0.2)
+            x = x.leaky_relu(LEAKY_SLOPE)
         x = self._final_layer(x)
         return pixel_shuffle(x, 2)
 
-    def forward_with_features(self, x: Tensor) -> tuple:
+    def forward_with_features(self, x: Tensor, noise_scale: Tensor = None) -> tuple:
         """Returns (pred, pre_final_features) for use with sigma branch."""
-        feats = self.__call__(x, return_features=True)
+        for conv, has_noise in zip(self.layers, self._layer_noise):
+            x = conv(x)
+            if has_noise:
+                x = x * (1.0 + Tensor.randn(*x.shape) * noise_scale * 0.2)
+            x = x.leaky_relu(LEAKY_SLOPE)
+        feats = x
         pred = pixel_shuffle(self._final_layer(feats), 2)
         return pred, feats
 
     @TinyJit
-    def _jit_call(self, x: Tensor) -> Tensor:
-        return self.__call__(x)
+    def _jit_call(self, x: Tensor, noise_scale: Tensor) -> Tensor:
+        return self.__call__(x, noise_scale)
 
     @TinyJit
-    def _jit_call_with_features(self, x: Tensor) -> tuple:
-        return self.forward_with_features(x)
+    def _jit_call_with_features(self, x: Tensor, noise_scale: Tensor) -> tuple:
+        return self.forward_with_features(x, noise_scale)
 
-    def upscale_channel(self, lr: Tensor) -> Tensor:
+    def upscale_channel(self, lr: Tensor, noise_scale: Tensor) -> Tensor:
         """lr: (H,W) for 1-channel models, or (3,H,W) for 3-channel models."""
         if self.is_3ch:
             x = lr.unsqueeze(0)  # (1,3,H,W)
         else:
             x = lr.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
         x_np = x.numpy()
+        base_wrap = self.is_wrapping and self.padding_enabled
         if self.is_blurbilinear:
-            blurred = box_blur5x5_np(x_np, self.is_wrapping)
-            base_np = upsample2x_np(blurred, self.is_wrapping)
+            blurred = box_blur5x5_np(x_np, base_wrap)
+            base_np = upsample2x_np(blurred, base_wrap)
         elif self.is_bilinear or self.is_raw:
-            base_np = upsample2x_np(x_np, self.is_wrapping)
+            base_np = upsample2x_np(x_np, base_wrap)
         else:
-            base_np = upscale_edi_2x_np(x_np, self.is_wrapping)
+            base_np = upscale_edi_2x_np(x_np, base_wrap)
         base = Tensor(base_np.astype(np.float32))
 
         if self.is_raw:
             base *= 0.0
 
-        residual = self._jit_call(x)
+        residual = self._jit_call(x, noise_scale)
 
         if not self.padding_enabled:
             _, _, rH, rW = residual.shape
