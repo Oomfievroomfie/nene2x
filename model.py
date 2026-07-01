@@ -9,7 +9,7 @@ from tinygrad.nn.state import get_state_dict, load_state_dict as tg_load_state_d
 
 """
 The network is run on one channel at a time.
-Outputs are the RESIDUAL above EDI or bilinear interpolation, not raw pixel values.
+Outputs are the RESIDUAL above EDI or some alternate interpolation, not raw pixel values.
 
 Config string syntax
 ────────────────────
@@ -45,6 +45,11 @@ Global prefix "r," marks a *3-channel RGB* model.
   • The network takes all 3 RGB channels simultaneously instead of one at a time.
   • Can be combined with other prefixes, e.g. "r,g,3x3_16,3x3_32,1x1_12"
   Example: "r,g,3x3_16,3x3_32,3x3_64,1x1_12"
+
+Global prefix "j," marks a *jinc-base* model.
+  • The base upscale uses a Jinc-windowed resampling filter (radially symmetric, EWA-style).
+  • Higher quality than bilinear for aliased/photo content.
+  Example: "j,3x3_12,1x1_12,3x3_24,1x1_4"
 """
 
 #gConfig = "3x3_8,1x1_4,3x3_10,3x3_6,1x1_4n"
@@ -93,7 +98,12 @@ Global prefix "r," marks a *3-channel RGB* model.
 #gConfig = "g,3x3_12,3x3_20q,3x3_20,3x3_20d,3x3_320d,3x3_64d,1x1_4"
 #gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
 #gConfig = "g,3x3_24,3x3_32,3x3_48,3x3_64,3x3_96,3x3_16d,1x1_4"
-gConfig = "g,3x3_24,3x3_32,3x3_40,3x3_48,3x3_128,1x1_4"
+#gConfig = "g,3x3_24,3x3_24,3x3_32,3x3_40,3x3_64,3x3_128,3x3_16,3x3_4"
+#gConfig = "j,3x3_24,3x3_24,3x3_32,3x3_32,3x3_64,3x3_4"
+#gConfig = "j,3x3_16,3x3_24q,3x3_96d,1x1_24,3x3_32,3x3_56,1x1_4"
+#gConfig = "j,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
+gConfig = "j,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
+#gConfig = "g,3x3_24,3x3_32,3x3_40,3x3_48,3x3_128,1x1_32,1x1_4d"
 #gConfig = "g,3x3_32,3x3_32q,3x3_48,3x3_96,3x3_40,1x1_4"
 
 # 9 25 49 81 121 169 225
@@ -136,6 +146,12 @@ def _parse_config(cfg: str) -> tuple:
         cfg = cfg[2:]
         is_raw = False
         is_bilinear = False
+    is_jinc = cfg.startswith("j,")
+    if is_jinc:
+        cfg = cfg[2:]
+        is_raw = False
+        is_bilinear = False
+        is_blurbilinear = False
     specs = []
     for token in cfg.split(","):
         token = token.strip()
@@ -148,14 +164,16 @@ def _parse_config(cfg: str) -> tuple:
         specs.append((k, int(c_str), "d" in flags, "n" in flags, "q" in flags, "w" in flags))
     expected_out = 12 if is_3ch else 4
     assert specs[-1][1] == expected_out, f"Final layer must output {expected_out} channels, got {specs[-1][1]}"
-    return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch
+    return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch, is_jinc
 
 
-def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False, is_raw: bool = False, is_3ch: bool = False) -> str:
+def _config_to_str(specs: list, is_bilinear: bool = False, is_blurbilinear: bool = False, is_raw: bool = False, is_3ch: bool = False, is_jinc: bool = False) -> str:
     def _token(k, c, dw, nb, dil=False, noise=False):
         return f"{k}x{k}_{c}{'d' if dw else ''}{'n' if nb else ''}{'q' if dil else ''}{'w' if noise else ''}"
     body = ",".join(_token(*s) for s in specs)
-    if is_blurbilinear:
+    if is_jinc:
+        body = "j," + body
+    elif is_blurbilinear:
         body = "g," + body
     elif is_bilinear:
         body = "b," + body
@@ -212,10 +230,11 @@ class UpscaleNet:
     def __init__(self, is_wrapping: bool = False):
         self.padding_enabled = True
         self.is_wrapping = is_wrapping
-        specs, is_bilinear, is_raw, is_blurbilinear, is_3ch = _parse_config(gConfig)
+        specs, is_bilinear, is_raw, is_blurbilinear, is_3ch, is_jinc = _parse_config(gConfig)
         self.is_bilinear = is_bilinear
         self.is_raw = is_raw
         self.is_blurbilinear = is_blurbilinear
+        self.is_jinc = is_jinc
         self.is_3ch = is_3ch
         self._build_layers(specs)
 
@@ -224,6 +243,7 @@ class UpscaleNet:
         is_raw = "zfinalx.weight" in state
         is_bilinear = "zfinalb.weight" in state
         is_blurbilinear = "zfinalg.weight" in state
+        is_jinc = "zfinalj.weight" in state
         final_key = "zfinal.weight"
         final_pfx = "zfinal"
         if is_bilinear:
@@ -233,11 +253,17 @@ class UpscaleNet:
             final_key = "zfinalg.weight"
             final_pfx = "zfinalg"
             is_bilinear = False
+        if is_jinc:
+            final_key = "zfinalj.weight"
+            final_pfx = "zfinalj"
+            is_bilinear = False
+            is_blurbilinear = False
         if is_raw:
             final_key = "zfinalx.weight"
             final_pfx = "zfinalx"
             is_bilinear = False
             is_blurbilinear = False
+            is_jinc = False
         assert final_key in state, f"No '{final_key}' in state dict"
 
         keys = sorted(k for k in state if k.startswith("layers.") and k.endswith(".weight"))
@@ -274,7 +300,7 @@ class UpscaleNet:
         no_bias = (final_pfx + ".bias") not in state
         specs.append((w.shape[2], w.shape[0], is_depthwise, no_bias, False, False))
         is_3ch = (first_in_c == 3)
-        return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch
+        return specs, is_bilinear, is_raw, is_blurbilinear, is_3ch, is_jinc
 
     def _build_layers(self, specs: list):
         in_c = 3 if self.is_3ch else 1
@@ -301,14 +327,16 @@ class UpscaleNet:
             final_attr = "zfinalb"
         if self.is_blurbilinear:
             final_attr = "zfinalg"
+        if self.is_jinc:
+            final_attr = "zfinalj"
         if self.is_raw:
             final_attr = "zfinalx"
         setattr(self, final_attr, convs[-1])
-        for stale in ("zfinal", "zfinalb", "zfinalg", "zfinalx"):
+        for stale in ("zfinal", "zfinalb", "zfinalg", "zfinalj", "zfinalx"):
             if stale != final_attr and hasattr(self, stale):
                 delattr(self, stale)
-        
-        cfg_str = _config_to_str(specs, self.is_bilinear, self.is_blurbilinear, self.is_raw, self.is_3ch)
+
+        cfg_str = _config_to_str(specs, self.is_bilinear, self.is_blurbilinear, self.is_raw, self.is_3ch, self.is_jinc)
         for stale in [k for k in self.__dict__ if k.startswith("zzzgConfig_")]:
             delattr(self, stale)
         self.zzzgConfig = cfg_str
@@ -328,12 +356,13 @@ class UpscaleNet:
         cfg_key = next((k for k in state if k.startswith("zzzgConfig_")), None)
         if cfg_key is not None:
             cfg_str = cfg_key[len("zzzgConfig_"):]
-            specs, is_bilinear, is_raw, is_blurbilinear, is_3ch = _parse_config(cfg_str)
+            specs, is_bilinear, is_raw, is_blurbilinear, is_3ch, is_jinc = _parse_config(cfg_str)
         else:
-            specs, is_bilinear, is_raw, is_blurbilinear, is_3ch = self._config_from_state(state)
+            specs, is_bilinear, is_raw, is_blurbilinear, is_3ch, is_jinc = self._config_from_state(state)
         self.is_bilinear = is_bilinear
         self.is_raw = is_raw
         self.is_blurbilinear = is_blurbilinear
+        self.is_jinc = is_jinc
         self.is_3ch = is_3ch
         self._build_layers(specs)
         tg_load_state_dict(self, state, strict=strict)
@@ -344,6 +373,8 @@ class UpscaleNet:
             return self.zfinalb
         if self.is_blurbilinear:
             return self.zfinalg
+        if self.is_jinc:
+            return self.zfinalj
         if self.is_raw:
             return self.zfinalx
         return self.zfinal
@@ -393,6 +424,8 @@ class UpscaleNet:
         if self.is_blurbilinear:
             blurred = box_blur5x5_np(x_np, base_wrap)
             base_np = upsample2x_np(blurred, base_wrap)
+        elif self.is_jinc:
+            base_np = jinc_upsample2x_np(x_np, base_wrap)
         elif self.is_bilinear or self.is_raw:
             base_np = upsample2x_np(x_np, base_wrap)
         else:
@@ -427,28 +460,33 @@ class FilterNet:
     __call__(pred, target) -> scalar loss (pred_mag - target_mag).abs().mean()
     """
 
-    def _center_and_limit_weights(self, f):
+    def _limit_weights(self, f):
         f.weight = f.weight.clamp(-1.0, 1.0)
-        #f.weight = f.weight - f.weight.mean(axis=[1,2,3], keepdim=True)
-        #f.weight = f.weight / f.weight.square().sum(axis=[1,2,3], keepdim=True).sqrt().clamp(1e-8, float('inf'))
-        pass
+
+    def _center_weights(self, f):
+        f.weight = f.weight - f.weight.mean(axis=[1,2,3], keepdim=True)
 
     def __init__(self):
         self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=3)
-        self.filters2 = Conv2dManual(8, 16, 3, bias=False, stride=2)
-        self._center_and_limit_weights(self.filters )
-        self._center_and_limit_weights(self.filters2)
+        self.filters2 = Conv2dManual(8, 32, 3, bias=False)
+        self.filters3 = Conv2dManual(32, 32, 3, bias=False, stride=2)
+        self._limit_weights(self.filters)
+        self._center_weights(self.filters)
+        self._limit_weights(self.filters2)
+        self._limit_weights(self.filters3)
 
     def normalize_filters(self):
-        self._center_and_limit_weights(self.filters )
-        self._center_and_limit_weights(self.filters2)
-        pass
+        self._limit_weights(self.filters)
+        self._center_weights(self.filters)
+        self._limit_weights(self.filters2)
+        self._limit_weights(self.filters3)
 
     def features(self, x: Tensor) -> Tensor:
-        x = self.filters(x).abs()
-        x = self.filters2(x).abs()
+        x = self.filters(x).leaky_relu(-0.05)
+        x = self.filters2(x).leaky_relu(-0.05)
+        x = self.filters3(x).abs()
         return x
-
+    
     def __call__(self, pred: Tensor, target: Tensor) -> Tensor:
         pred_f   = self.features(pred)  .avg_pool2d(kernel_size=(3, 3), stride=2)
         target_f = self.features(target).avg_pool2d(kernel_size=(3, 3), stride=2)
@@ -456,9 +494,7 @@ class FilterNet:
         diff = diff * Tensor.rand(diff.shape) * 2.0
         per_sample = Tensor.rand(diff.shape[0]).reshape(-1, 1, 1, 1) * 2.0
         
-        #norm = (self.filters.weight.abs().sum() + self.filters2.weight.abs().sum()) / 16.0
-        norm = 1.0
-        return (diff * per_sample / norm).sum(axis=1).mean()
+        return (diff * per_sample).sum(axis=1).mean()
 
 
 class FilterNet2:
@@ -473,7 +509,7 @@ class FilterNet2:
         f.weight = f.weight - f.weight.mean(axis=[1,2,3], keepdim=True)
 
     def __init__(self):
-        self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=2)
+        self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=3)
         self.filters2 = Conv2dManual(8, 24, 3, bias=False)
         self.filters3 = Conv2dManual(24, 8, 3, bias=False, stride=2)
         self._limit_weights(self.filters)
@@ -488,19 +524,17 @@ class FilterNet2:
         self._limit_weights(self.filters3)
 
     def features(self, x: Tensor) -> Tensor:
-        x = self.filters(x).abs()
-        x = self.filters2(x).abs()
-        x = self.filters3(x).abs()
+        x = self.filters(x)
+        x = self.filters2(x).leaky_relu(0.2)
+        x = self.filters3(x).leaky_relu(-0.02)
         return x
 
     def __call__(self, pred: Tensor) -> Tensor:
-        pred_f = self.features(pred).avg_pool2d(kernel_size=(3, 3), stride=2)
+        pred_f = self.features(pred).avg_pool2d(kernel_size=(3, 3), stride=3)
         pred_f = pred_f * Tensor.rand(pred_f.shape) * 2.0
         per_sample = Tensor.rand(pred_f.shape[0]).reshape(-1, 1, 1, 1) * 2.0
         
-        norm = (self.filters.weight.abs().sum() + self.filters2.weight.abs().sum()) / 16.0
-        
-        return (pred_f * per_sample / norm).sum(axis=1).mean()
+        return (pred_f * per_sample).sum(axis=1).mean()
 
 
 # ── Sigma branch for ℓE loss ──────────────────────────────────────────────────
@@ -615,6 +649,73 @@ def upsample2x(t, is_wrapping: bool = False):
     if isinstance(t, Tensor):
         return Tensor(upsample2x_np(t.numpy().astype(np.float32), is_wrapping))
     return upsample2x_np(t.astype(np.float32), is_wrapping)
+
+
+_j_kernels = {}
+def _build_jinc_kernel(n_lobes: int) -> np.ndarray:
+    """
+    Build a jinc resampling kernel for 2x zero-dilated upscaling.
+    Size: (4*n_lobes) x (4*n_lobes) in dilated-pixel units.
+    A 0.5 dilated-pixel offset is baked in to match pixel-center alignment
+    after zero-dilation (input pixel i placed at dilated position 2i).
+    Window: max(0, 1 - (r/n_lobes)^2) — radial Welch window.
+    Normalized so DC gain = 1 for zero-stuffed 2x upscale (kernel.sum() = 4).
+    """
+    global _j_kernels
+    if n_lobes in _j_kernels:
+        return _j_kernels[n_lobes]
+    from scipy.special import j1
+    ks = 4 * n_lobes
+    c = np.arange(ks, dtype=np.float64) - (ks // 2 + 0.5)
+    dy, dx = np.meshgrid(c, c, indexing='ij')
+    r = np.sqrt(dy**2 + dx**2) / 2.0  # input-pixel units, centered on central lobe
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pr = np.pi * r
+        jinc_val = np.where(r < 1e-8, 1.0, 2.0 * j1(pr) / pr)
+    window_r = n_lobes - 0.25  # 0.5 dilated-px shift reduces effective capability radius by 0.25 input px
+    kernel = (jinc_val * np.maximum(0.0, 1.0 - (r / window_r) ** 2)).astype(np.float32)
+    kernel *= 4.0 / kernel.sum()
+    _j_kernels[n_lobes] = kernel
+    return kernel
+
+
+def jinc_upsample2x_np(t: np.ndarray, is_wrapping: bool = False, n_lobes: int = 4) -> np.ndarray:
+    """
+    2x upscale via zero-dilation + jinc-windowed convolution.
+    t: (B, C, H, W) or (C, H, W) numpy float32.
+    """
+    from scipy.ndimage import convolve as nd_convolve
+
+    batched = t.ndim == 4
+    if not batched:
+        t = t[np.newaxis]
+    B, C, H, W = t.shape
+
+    kernel = _build_jinc_kernel(n_lobes)
+    pad = n_lobes  # input-pixel padding = 2*n_lobes dilated pixels = kernel half-width
+
+    pad_mode = 'wrap' if is_wrapping else 'edge'
+    t_pad = np.pad(t, ((0,0),(0,0),(pad,pad),(pad,pad)), mode=pad_mode)  # (B,C,H+2p,W+2p)
+
+    pH, pW = H + 2*pad, W + 2*pad
+    dilated = np.zeros((B, C, pH*2, pW*2), dtype=np.float32)
+    dilated[:, :, ::2, ::2] = t_pad
+
+    dp = 2 * pad  # dilated-pixel offset to valid region
+    out = np.empty((B, C, H*2, W*2), dtype=np.float32)
+    for b in range(B):
+        for c_ in range(C):
+            full = nd_convolve(dilated[b, c_], kernel, mode='constant', cval=0.0)
+            out[b, c_] = full[dp:dp+H*2, dp:dp+W*2]
+
+    return (out if batched else out[0]).astype(np.float32)
+
+
+def jinc_upsample2x(t, is_wrapping: bool = False):
+    """Wrapper that accepts numpy or Tensor."""
+    if isinstance(t, Tensor):
+        return Tensor(jinc_upsample2x_np(t.numpy().astype(np.float32), is_wrapping))
+    return jinc_upsample2x_np(t.astype(np.float32), is_wrapping)
 
 
 def upscale_edi_2x_np(t: np.ndarray, is_wrapping: bool = False) -> np.ndarray:

@@ -12,12 +12,12 @@ from PIL import Image
 from tqdm import tqdm
 
 from tinygrad import Tensor, TinyJit
-from tinygrad.nn.optim import AdamW
+from tinygrad.nn.optim import AdamW, Adam
 from tinygrad.nn.state import get_state_dict, safe_save, safe_load
 
 from model import (UpscaleNet, SigmaBranch, FilterNet, FilterNet2, gaussian_blur,
                    manual_downscale2x, upscale_edi_2x, upscale_edi_2x_np,
-                   upsample2x, upsample2x_np, box_blur5x5_np)
+                   upsample2x, upsample2x_np, jinc_upsample2x_np, box_blur5x5_np)
 
 
 # ── loss helpers ──────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ def loss_lE(mu: Tensor, hr: Tensor, sigma: Tensor = None, beta: float = 0.01) ->
     #   loss_main = mean(abs(mu + sigma_gt * z.detach() - hr))
     #   loss_aux  = mean(abs(sigma_pre - sigma_gt.detach()))
     #   return loss_main + beta * loss_aux
-    beta = 0.2
+    
     sigma_gt = (hr - mu).abs()
     z = Tensor.randn(*mu.shape)
     z = z * (sigma_gt > sigma_gt.mean()).detach()
@@ -154,11 +154,17 @@ def ntlfb():
          [ 1.0,  0.0, -1.0]],
         
         # small edges
-        [[ 1.0, -1.0,  0.0],
+        [[ 0.0,  0.0,  0.0],
          [ 1.0, -1.0,  0.0],
          [ 0.0,  0.0,  0.0]],
-        [[ 1.0,  1.0,  0.0],
-         [-1.0, -1.0,  0.0],
+        [[ 0.0,  1.0,  0.0],
+         [ 0.0, -1.0,  0.0],
+         [ 0.0,  0.0,  0.0]],
+        [[ 1.0,  0.0,  0.0],
+         [ 0.0, -1.0,  0.0],
+         [ 0.0,  0.0,  0.0]],
+        [[ 0.0,  0.0,  1.0],
+         [ 0.0, -1.0,  0.0],
          [ 0.0,  0.0,  0.0]],
         #
         ## grid noise 
@@ -368,6 +374,25 @@ def loss_depix(pred: Tensor, target: Tensor) -> Tensor:
     m = (H - 1) // 2
     loss_v = ((p_v[:, :, 1::2, :][:, :, :m, :] - p_v[:, :, 2::2, :][:, :, :m, :]).abs()
             - (t_v[:, :, 1::2, :][:, :, :m, :] - t_v[:, :, 2::2, :][:, :, :m, :]).abs()).relu().mean()
+
+    return (loss_h + loss_v) * 0.5
+
+
+def loss_depix_nosub(pred: Tensor, target: Tensor, stride: int = 2) -> Tensor:
+    """Like loss_depix but without row/column subsampling — operates directly on output pixels."""
+    W = min(pred.shape[3], target.shape[3])
+    H = min(pred.shape[2], target.shape[2])
+
+    p = pred  [:, :, :H, :W]
+    t = target[:, :, :H, :W]
+
+    n = (W - 1) // 2
+    loss_h = ((p[:, :, ::stride, 1::2][:, :, :, :n] - p[:, :, ::stride, 2::2][:, :, :, :n]).abs()
+            - (t[:, :, ::stride, 1::2][:, :, :, :n] - t[:, :, ::stride, 2::2][:, :, :, :n]).abs()).relu().mean()
+
+    m = (H - 1) // 2
+    loss_v = ((p[:, :, 1::2, ::stride][:, :, :m, :] - p[:, :, 2::2, ::stride][:, :, :m, :]).abs()
+            - (t[:, :, 1::2, ::stride][:, :, :m, :] - t[:, :, 2::2, ::stride][:, :, :m, :]).abs()).relu().mean()
 
     return (loss_h + loss_v) * 0.5
 
@@ -591,18 +616,20 @@ class UpscaleDataset:
 # ── saving ────────────────────────────────────────────────────────────────────
 
 
-def trysave(model, out_path, sigma_branch=None, filter_net=None):
+def trysave(model, out_path, sigma_branch=None, filter_net=None, filter_net_prefix=None, extra_tensors=None):
     import time
     from safetensors.numpy import save_file as sf_save_numpy
     model._add_config_tensor()
 
     tensors_np = {k: v.numpy() for k, v in get_state_dict(model).items()}
+    if extra_tensors is not None:
+        tensors_np.update(extra_tensors)
     if sigma_branch is not None:
         for k, v in get_state_dict(sigma_branch).items():
             tensors_np[f"sigma_branch.{k}"] = v.numpy()
-    if filter_net is not None:
+    if filter_net is not None and filter_net_prefix is not None:
         for k, v in get_state_dict(filter_net).items():
-            tensors_np[f"filter_net.{k}"] = v.numpy()
+            tensors_np[f"{filter_net_prefix}.{k}"] = v.numpy()
     # Because of transient OS-side file locking (e.g. windows defender passive scans)
     #   we need to try saving multiple times.
     for attempt in range(3):
@@ -641,21 +668,23 @@ def clip_grad_norm_(params, max_norm: float):
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
         return
-    total_sq = sum(g.pow(2).sum() for g in grads)
-    total_norm = total_sq.sqrt().numpy().item()
-    if total_norm > max_norm:
-        scale = max_norm / (total_norm + 1e-6)
-        for p in params:
-            if p.grad is not None:
-                p.grad = p.grad * scale
+    total_sq = sum(g.square().sum() for g in grads)
+    total_norm = total_sq.sqrt()
+    multiplier = (max_norm / (total_norm + 1e-6)).clip(-1e6, 1.0)
+    for p in params:
+        if p.grad is not None:
+            p.grad.assign(p.grad * multiplier)
 
 
 # ── cosine LR ─────────────────────────────────────────────────────────────────
 
 def cosine_lr(epoch: int, total_epochs: int, lr_max: float, lr_min: float) -> float:
     ret = lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * epoch / total_epochs))
-    i = min(float(epoch + 1.0) * 0.35, 1.0)
-    return ret * i
+    # slow start
+    #i = min(float(epoch + 0.5) / 10.0, 1.0)
+    i = min(float(epoch + 0.5) / 6.0, 1.0)
+    #return ret * i
+    return ret
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
@@ -690,26 +719,65 @@ def train(args: argparse.Namespace):
         print(f"Resumed weights from {args.resume}")
 
     filter_net = None
+    filter_net_prefix = None
+    extra_tensors = {}  # other filtersnets from the checkpoint to preserve
     if args.adv_filter_loss or args.adv_filter2_loss:
         filter_net = FilterNet2() if args.adv_filter2_loss else FilterNet()
+        filter_net_prefix = "filter_net_adv2" if args.adv_filter2_loss else "filter_net_adv"
         if args.resume and Path(args.resume).exists():
             import shutil, tempfile, os
             fd, temp_path = tempfile.mkstemp(suffix=".safetensors")
             os.close(fd)
             shutil.copy(args.resume, temp_path)
             state = safe_load(temp_path)
-            fn_state = {k[len("filter_net."):]: v
-                        for k, v in state.items() if k.startswith("filter_net.")}
-            if fn_state:
+            if not args.clean:
+                # collect all filternet keys not belonging to this run's prefix, to preserve them
+                all_fn_prefixes = {"filter_net_adv", "filter_net_adv2", "filter_net"}
+                for pfx in all_fn_prefixes:
+                    if pfx == filter_net_prefix:
+                        continue
+                    for k, v in state.items():
+                        if k.startswith(pfx + "."):
+                            extra_tensors[k] = v.numpy() if hasattr(v, 'numpy') else v
+                # preserve sigma branch (le_loss and adv_filter are mutually exclusive)
+                for k, v in state.items():
+                    if k.startswith("sigma_branch."):
+                        extra_tensors[k] = v.numpy() if hasattr(v, 'numpy') else v
+            fn_state = {k[len(filter_net_prefix)+1:]: v
+                        for k, v in state.items() if k.startswith(filter_net_prefix + ".")}
+            if not fn_state:
+                # fall back to legacy "filter_net." key
+                fn_state = {k[len("filter_net."):]: v
+                            for k, v in state.items() if k.startswith("filter_net.")}
+            if fn_state and not args.clean:
                 from tinygrad.nn.state import load_state_dict as tg_load_state_dict
                 tg_load_state_dict(filter_net, fn_state)
-                print("Resumed filter_net weights")
+                print(f"Resumed {filter_net_prefix} weights")
+            elif args.clean:
+                print(f"--clean: discarding {filter_net_prefix} weights, starting fresh")
             else:
-                print("No filter_net weights in checkpoint — starting fresh")
+                print(f"No {filter_net_prefix} weights in checkpoint — starting fresh")
             try:
                 os.remove(temp_path)
             except OSError:
                 pass
+    elif args.resume and Path(args.resume).exists():
+        if not args.clean:
+            # neither filternet nor sigma active — preserve both from checkpoint
+            import shutil, tempfile, os
+            fd, temp_path = tempfile.mkstemp(suffix=".safetensors")
+            os.close(fd)
+            shutil.copy(args.resume, temp_path)
+            state = safe_load(temp_path)
+            for k, v in state.items():
+                if k.startswith("filter_net") or k.startswith("sigma_branch."):
+                    extra_tensors[k] = v.numpy() if hasattr(v, 'numpy') else v
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        else:
+            print("--clean: discarding all filternet and sigma branch weights from checkpoint")
 
     sigma_branch = None
     if args.le_loss:
@@ -726,19 +794,25 @@ def train(args: argparse.Namespace):
             os.close(fd)
             shutil.copy(args.resume, temp_path)
             state = safe_load(temp_path)
+            if not args.clean:
+                # preserve filternet keys (le_loss and adv_filter are mutually exclusive)
+                for k, v in state.items():
+                    if k.startswith("filter_net"):
+                        extra_tensors[k] = v.numpy() if hasattr(v, 'numpy') else v
             sigma_state = {k[len("sigma_branch."):]: v
                            for k, v in state.items() if k.startswith("sigma_branch.")}
-            if sigma_state:
+            if sigma_state and not args.clean:
                 from tinygrad.nn.state import load_state_dict as tg_load_state_dict
                 tg_load_state_dict(sigma_branch, sigma_state)
                 print("Resumed sigma branch weights")
+            elif args.clean:
+                print("--clean: discarding sigma branch weights, starting fresh")
             else:
                 print("No sigma branch weights in checkpoint — starting sigma branch fresh")
             try:
                 os.remove(temp_path)
             except OSError:
                 pass
-
     net_params    = sum(p.numpy().size for p in get_state_dict(net).values())
     sigma_params  = sum(p.numpy().size for p in get_state_dict(sigma_branch).values()) if sigma_branch is not None else 0
     filter_params = sum(p.numpy().size for p in get_state_dict(filter_net).values()) if filter_net is not None else 0
@@ -764,7 +838,7 @@ def train(args: argparse.Namespace):
     if pad > 0:
         net.set_padding_enabled(False)
 
-    trysave(net, out_path, sigma_branch, filter_net)
+    trysave(net, out_path, sigma_branch, filter_net, filter_net_prefix, extra_tensors)
 
     if net.is_raw:
         def baseline_fn(t):
@@ -780,6 +854,10 @@ def train(args: argparse.Namespace):
         def baseline_fn(t):
             arr = t.numpy() if isinstance(t, Tensor) else t
             return upsample2x_np(arr, is_wrapping=False)
+    elif net.is_jinc:
+        def baseline_fn(t):
+            arr = t.numpy() if isinstance(t, Tensor) else t
+            return jinc_upsample2x_np(arr, is_wrapping=False)
     else:
         def baseline_fn(t):
             arr = t.numpy() if isinstance(t, Tensor) else t
@@ -812,7 +890,8 @@ def train(args: argparse.Namespace):
     )
     print(f"Validation set: {len(val_dataset.pairs)} pairs")
 
-    opt = AdamW(params, lr=args.lr, b1=0.9, b2=0.999, weight_decay=0.0)
+    #opt = AdamW(params, lr=args.lr, b1=0.9, b2=0.975, weight_decay=0.0)
+    opt = Adam(params, lr=args.lr, b1=0.9, b2=0.999, eps=1e-8)
     best_loss = float("inf")
 
     use_basic_loss = not args.fancy_loss
@@ -821,7 +900,9 @@ def train(args: argparse.Namespace):
     use_adv_filter2 = args.adv_filter2_loss
 
     filter_params = list(get_state_dict(filter_net).values()) if filter_net is not None else []
-    opt_filter = AdamW(filter_params, lr=1e-4, b1=0.5, b2=0.9, weight_decay=1e-6) if filter_net is not None else None
+    #opt_filter = AdamW(filter_params, lr=1e-4, b1=0.7, b2=0.95, weight_decay=0.0) if filter_net is not None else None
+    opt_filter = AdamW(filter_params, lr=3e-5, b1=0.8, b2=0.97, weight_decay=0.0) if filter_net is not None else None
+    #opt_filter = AdamW(filter_params, lr=3e-5, b1=0.9, b2=0.999, weight_decay=0.0) if filter_net is not None else None
 
     def _optstep():
         clip_grad_norm_(params, max_norm=1.0)
@@ -842,29 +923,41 @@ def train(args: argparse.Namespace):
             # Generator step: minimize learned texture magnitude difference
             opt.zero_grad()
 
-            adv_loss = filter_net(pred, res_batch)
-            adv_val = filter_net(pred.detach(), res_batch).detach()
-            gt_val = filter_net(res_batch + Tensor.rand(res_batch.shape) * 0.1, res_batch)
+            adv_loss = filter_net(pred_full, hr_batch)
+            adv_val = filter_net(pred_full.detach(), res_batch).detach()
 
             loss_lowpass = lowpassed_l1_loss(pred_full, hr_batch)
+            #pred_down = pred_full.avg_pool2d(2)
+            #hr_down = hr_batch.avg_pool2d(2)
+            #loss_down = (pred_down - hr_down).abs().mean()
+            
+            #loss_l1 = (pred - res_batch).abs().mean()
+            # Intentionally used without sigma branch. We're ONLY interested in the stochastic distribution-retaining
+            # properties of lE loss here, so that it doesn't fight against adversarial reconstruction as much.
+            loss_l1 = loss_lE(pred_full, hr_batch)
 
             gen_loss = (
-                  0.7 * adv_loss
-                + 0.2 * loss_depix(pred_full, hr_batch)
-                + 0.7 * (pred - res_batch).abs().mean()
-                + 0.5 * loss_lowpass)
+                  0.3 * adv_loss
+                + 0.3 * loss_depix(pred_full, hr_batch)
+                #+ 0.3 * loss_depix_nosub(pred_full, hr_batch)
+                #+ 0.5 * loss_l1
+                + 1.0 * loss_l1
+                #+ 0.9 * loss_down
+                #+ 0.5 * loss_lowpass
+                )
 
             gen_loss.backward()
             _optstep()
 
-            # Discriminator step
+            # Discriminator step: train FilterNet features to be 0.2 for ground truth, 0.0 for prediction
             opt_filter.zero_grad()
-
-            disc_loss = (filter_net(pred, res_batch) - 0.2).abs() + gt_val
+            gt_feat_mean   = filter_net.features(hr_batch       ).mean()
+            pred_feat_mean = filter_net.features(pred_full.detach()   ).mean()
+            disc_loss = (gt_feat_mean - 0.035).abs() + pred_feat_mean.abs()
             disc_loss.backward()
             _filter_optstep()
 
-            return Tensor.stack(gen_loss, adv_val, gt_val).realize()
+            return Tensor.stack(gen_loss, pred_feat_mean, gt_feat_mean).realize()
     elif use_adv_filter2:
         @TinyJit
         def train_step(lr_batch: Tensor, res_batch: Tensor, base_batch: Tensor, hr_batch: Tensor, z: Tensor, noise_scale: Tensor) -> Tensor:
@@ -874,24 +967,28 @@ def train(args: argparse.Namespace):
             # Generator step: minimize learned texture variance
             opt.zero_grad()
             adv_loss = filter_net(pred_full)
+            gt_loss = filter_net(pred_full)
             adv_val = filter_net(pred_full.detach()).detach()
             gt_val = filter_net(hr_batch.detach()).detach()
 
             #loss_lowpass = lowpassed_l1_loss(pred_full, hr_batch)
 
-            pred_down = pred_full.avg_pool2d(2)
-            hr_down = hr_batch.avg_pool2d(2)
-            loss_down = (pred_down - hr_down).abs().mean()
-            loss_l1 = (pred - res_batch).abs().mean()
-            #loss_l2 = (pred - res_batch).abs().mean()
+            #pred_down = pred_full.avg_pool2d(2)
+            #hr_down = hr_batch.avg_pool2d(2)
+            #loss_down = (pred_down - hr_down).abs().mean()
+            #loss_l1 = (pred - res_batch).abs().mean()
+            # Intentionally used without sigma branch. We're ONLY interested in the stochastic distribution-retaining
+            # properties of lE loss here, so that it doesn't fight against adversarial reconstruction as much.
+            loss_l1 = loss_lE(pred_full, hr_batch)
 
             gen_loss = (
+                  #2.7 * (adv_loss - gt_loss).abs()
                   0.7 * adv_loss
-                + 0.2 * loss_depix(pred_full, hr_batch)
+                #+ 0.3 * loss_depix(pred_full, hr_batch)
                 + 0.5 * loss_l1
-                #+ 0.5 * loss_l1
+                #+ 1.4 * loss_down
                 #+ 0.5 * loss_lowpass
-                + 1.4 * loss_down)
+                )
 
             gen_loss.backward()
             _optstep()
@@ -938,7 +1035,7 @@ def train(args: argparse.Namespace):
     noise_warmup_batches = 60
 
     for epoch in range(start_epoch, args.epochs + 1):
-        new_lr = cosine_lr(epoch - 1, args.epochs, args.lr, args.lr * 0.1)
+        new_lr = cosine_lr(epoch - 1, args.epochs, args.lr, args.lr * 0.25)
         opt.lr = Tensor([new_lr])
         
         #if opt_filter:    
@@ -1015,11 +1112,11 @@ def train(args: argparse.Namespace):
             print(f"Epoch {epoch:4d} | train {avg_loss:.6f} | val {val_loss:.6f} | lr {new_lr:.2e}{filter_suffix}")
             if val_loss < best_loss:
                 best_loss = val_loss
-                trysave(net, out_path, sigma_branch, filter_net)
+                trysave(net, out_path, sigma_branch, filter_net, filter_net_prefix, extra_tensors)
                 print(f"  saved {out_path}  (best val loss {best_loss:.6f})")
         else:
             print(f"Epoch {epoch:4d} | loss {avg_loss:.6f} | lr {new_lr:.2e}{filter_suffix}")
-            trysave(net, out_path, sigma_branch, filter_net)
+            trysave(net, out_path, sigma_branch, filter_net, filter_net_prefix, extra_tensors)
 
     print("Training complete.")
 
@@ -1097,8 +1194,9 @@ def main():
     tr.add_argument("--fancy-loss",        action="store_true")
     tr.add_argument("--le-loss",           action="store_true", help="Use ℓE loss (arXiv:2201.10084)")
     tr.add_argument("--le-beta",           type=float, default=0.01, help="Penalty factor β for σ auxiliary loss")
-    tr.add_argument("--adv-filter-loss",   action="store_true", help="Use adversarial FilterNet loss (two-arg, pred vs target)")
-    tr.add_argument("--adv-filter2-loss",  action="store_true", help="Use adversarial FilterNet2 loss (single-arg, pred only)")
+    tr.add_argument("--adv-filter-loss",   action="store_true", help="Use adversarial FilterNet loss (cross-domain micro-GAN on features)")
+    tr.add_argument("--adv-filter2-loss",  action="store_true", help="Use adversarial FilterNet2 loss (micro-GAN on outputs)")
+    tr.add_argument("--clean",             action="store_true", help="Delete all stored filternet weights from checkpoint on load")
     tr.add_argument("--strict-validation", action="store_true")
     tr.add_argument("--val-data",          default=None)
 

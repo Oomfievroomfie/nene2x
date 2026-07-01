@@ -56,13 +56,33 @@ Run `glsl.py` on one of the networks in `pretrained/` to get a set of GLSL funct
 
 ## Training
 
-Modify `model.py` directly to set the network architecture before training. There's a `gConfig` variable with old configs listed. Training data is in `train_authentic/`, and the images in this repo are the ones I actually used to train the pretrained models. Trains in 10~25 minutes on an RX 6800 depending on network size.
+Modify `model.py` directly to set the network architecture before training. There's a `gConfig` variable with old configs listed. Training data is in `train_authentic/`. Small networks train in 10~25 minutes on an RX 6800 depending on network size.
 
 `uv run python train.py train_authentic/ --epochs 700`
 
-**NOTE:** Some very small network geometries are extremely prone to breaking (getting trapped in bad local minima) on unlucky initializations, such that they fail to stop producing some artifacts during training. For such networks, use `train_until_good.py` to get them started, then resume them with the main training script and `--resume`. Training is done with Leaky ReLUs instead of pure ReLUs to make this problem less common, but it can still happen for extremely small network configurations.
+## Training Tips
 
-If gridlines or checkerboards appear on certain colors of flat surface after training, don't throw the model away. Instead, `--resume` a copy of it with a very low learning rate like `--lr 0.001` for a few epochs. If the artifacts still appear, try again. If they still appear, try a higher or lower learning rate.
+**NOTE IMPORTANTLY:** Some very small network geometries are extremely prone to breaking (getting trapped in bad local minima) on unlucky initializations, such that they fail to stop producing some artifacts during training. For such networks, use `train_until_good.py` to get them started, then resume them with the main training script and `--resume`. Training is done with Leaky ReLUs instead of pure ReLUs to make this problem less common, but it can still happen for extremely small network configurations.
+
+If gridlines or checkerboards appear on certain colors of flat surface after training, don't throw the model away. Instead, `--resume` a copy of it with a very low learning rate like `--lr 0.0001` for a few epochs. If the artifacts still appear, try again. If they still appear, try a higher or lower learning rate, or a different loss function.
+
+For extremely large networks, it's beneficial to switch back and forth (resuming training) between the mixed "authentic" training data set, and either the photo or illustration data set, depending on whether you're making an illust or photo upscaler. If you're making a generic upscaler, you should switch back and forth between all three.
+
+If you're using `--adv-filter2-loss`, it's basically a microscopic GAN, but because it's so small, it's prone to learning to emit speckles and hard edge lines. Fine tuning at the very end of training with fancy loss for 5 epochs and a los learning rate can reduce them, but make a bcakup first: `--fancy-loss --epochs 5 --lr 0.00004`
+
+```
+    --fancy-loss         - Loss uses high-freq feature vectors to punish blurry output.
+    --le-loss            - Vibecoded implementation of arXiv:2201.10084. Blurry.
+    --adv-filter-loss    - A micro-GAN-like thing inspired by fancy loss. GAN learns
+                            feature vectors only, loss is feature vector difference.
+                            In effect, the micro-GAN learns what features the upscaler
+                            is failing to produce the right amounts of, rather than
+                            telling the upscaler whether its output looks real or not.
+    --adv-filter2-loss   - A straight up micro-GAN that operates on raw output like a
+                            normal GAN does, but so small that it can't hallucinate.
+                            Aside from the size, this is a normal GAN in that it tells
+                            the upscaler whether its output looks real or not.
+```
 
 ## Results
 
