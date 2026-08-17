@@ -71,6 +71,8 @@ For extremely large networks, it's beneficial to switch back and forth (resuming
 
 If you're using `--adv-filter2-loss`, it's basically a microscopic GAN, but because it's so small, it's prone to learning to emit speckles and hard edge lines. Fine tuning at the very end of training with fancy loss for 5 epochs and a los learning rate can reduce them, but make a bcakup first: `--fancy-loss --epochs 5 --lr 0.00004`
 
+The best loss functions tend to be `--adv-filter-loss`, `--fancy-loss`, and the default/unspecified (which is either L1 or L2, probably L1, but I didn't double check). `--le-loss` works but is slow and almost indistinguishable from the default L1 loss. adv-filter2-loss is good for short runs but tends to degenerate and start generating artifacts on long runs, especially on medium-sized models.
+
 ```
     --fancy-loss         - Loss uses high-freq feature vectors to punish blurry output.
     --le-loss            - Vibecoded implementation of arXiv:2201.10084. Blurry.
