@@ -1421,8 +1421,8 @@ def _bc7_mode7(pixels, pca=0, best_pid=None, lite=False, nano=False):
         base_f = np.where(m0[None, :, None], dq0_s0[:, None, :], dq0_s1[:, None, :])
         end_f  = np.where(m0[None, :, None], dq1_s0[:, None, :], dq1_s1[:, None, :])
         w      = weights[indices.astype(np.int32)].astype(np.float32)
-        recon  = np.floor((np.float32(64) - w[:, :, None]) * base_f +
-                           w[:, :, None] * end_f + 32) / 64
+        recon  = np.floor(((np.float32(64) - w[:, :, None]) * base_f +
+                           w[:, :, None] * end_f + 32) / 64)
         error  = _bc7_error_helper(pix, recon).sum(axis=(1, 2))
 
         # Pack 128 bits
@@ -1510,9 +1510,8 @@ def _compress_bc7_s(blocks_rgba, pca=0, lite=False, nano=False, zero=False):
     best_blk[better] = blk3[better]; best_err[better] = err3[better]
 
     blk7, err7 = _bc7_mode7(pf, pca=pca, best_pid=pid, lite=lite, nano=nano)
-    better = err7 < best_err * 1e30
+    better = err7 < best_err
     best_blk[better] = blk7[better]; best_err[better] = err7[better]
-    return best_blk
     
     if nano: return best_blk
 

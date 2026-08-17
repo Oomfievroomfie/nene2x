@@ -9,7 +9,7 @@ while True:
     attempt += 1
     print(f"\n=== Attempt {attempt} ===")
 
-    r = subprocess.run(["uv", "run", "python", "train.py", DATA, "--epochs", "50", "--out", "upscaler.safetensors"])
+    r = subprocess.run(["uv", "run", "python", "train.py", DATA, "--epochs", "50", "--out", "upscaler.safetensors", "--seed", str(attempt+42)])
     if r.returncode != 0:
         print(f"train.py failed (exit {r.returncode}), retrying...")
         continue

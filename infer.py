@@ -159,19 +159,50 @@ def _ycgco_to_rgb(t: np.ndarray) -> np.ndarray:
     return out
 
 
+# ── baseline (no-NN) upscale dispatch ──────────────────────────────────────
+
+BASELINE_MODES = ("bilinear", "blurbilinear", "jinc", "edi")
+
+
+def _baseline_upscale_np(t: np.ndarray, mode: str, is_wrapping: bool) -> np.ndarray:
+    """2× upscale (B, C, H, W) or (C, H, W) float32 with no neural network."""
+    import model as model_module
+    if mode == "bilinear":
+        return model_module.upsample2x_np(t, is_wrapping)
+    elif mode == "blurbilinear":
+        blurred = model_module.box_blur5x5_np(t, is_wrapping)
+        return model_module.upsample2x_np(blurred, is_wrapping)
+    elif mode == "jinc":
+        return model_module.jinc_upsample2x_np(t, is_wrapping)
+    elif mode == "edi":
+        return model_module.upscale_edi_2x_np(t, is_wrapping)
+    raise ValueError(f"Unknown baseline mode: {mode}")
+
+
 # ── bilinear upsample helper ─────────────────────────────────────────────────
 
 def _bilinear_upsample_2x(ch: np.ndarray) -> np.ndarray:
-    """2× upscale a (H, W) channel with corner-aligned bilinear interpolation."""
+    """2× upscale a (H, W) channel with corner-aligned bilinear interpolation.
+
+    Corner-aligned = half-pixel offset: the 2× output grid extends beyond
+    [0, H-1], so sampling near the boundary repeats edge pixels rather than
+    interpolating to nothing.
+
+    For a 2→1000 case this puts ~250 output positions past each end of the
+    source range — those get edge-clamped instead of interpolating inward.
+    """
     H, W = ch.shape
     H2, W2 = H * 2, W * 2
-    # corner-aligned: pixel 0 → pixel 0, pixel H-1 → pixel 2H-2
-    ys = np.linspace(0, H - 1, H2, dtype=np.float32)
-    xs = np.linspace(0, W - 1, W2, dtype=np.float32)
-    y0 = np.floor(ys).astype(np.int32).clip(0, H - 1)
-    x0 = np.floor(xs).astype(np.int32).clip(0, W - 1)
-    y1 = (y0 + 1).clip(0, H - 1)
-    x1 = (x0 + 1).clip(0, W - 1)
+    # half-pixel offset: (i + 0.5) * H/H2 - 0.5  →  linspace(-0.25, H-0.75, H2)
+    ys = np.linspace(-0.25, H - 0.75, H2, dtype=np.float32)
+    xs = np.linspace(-0.25, W - 0.75, W2, dtype=np.float32)
+    # edge-clamp so out-of-range positions sample the boundary pixel
+    ys = ys.clip(0, H - 1)
+    xs = xs.clip(0, W - 1)
+    y0 = np.floor(ys).astype(np.int32).clip(0, H - 2 if H > 1 else 0)
+    x0 = np.floor(xs).astype(np.int32).clip(0, W - 2 if W > 1 else 0)
+    y1 = y0 + 1
+    x1 = x0 + 1
     ty = (ys - y0).astype(np.float32)[:, np.newaxis]
     tx = (xs - x0).astype(np.float32)[np.newaxis, :]
     a = ch[y0[:, np.newaxis], x0[np.newaxis, :]]
@@ -190,7 +221,8 @@ def upscale_image(model: UpscaleNet,
                   tile_size: int | None = None,
                   wrap: bool = True,
                   ycgco: bool = False,
-                  yonly: bool = False) -> Image.Image:
+                  yonly: bool = False,
+                  baseline: str | None = None) -> Image.Image:
     global timesum
     import time
 
@@ -208,7 +240,14 @@ def upscale_image(model: UpscaleNet,
 
     start = time.perf_counter()
 
-    if model.is_3ch:
+    if baseline is not None:
+        # ── fast-path: no neural network, just the baseline upscaler ──
+        base_np = _baseline_upscale_np(tensor[np.newaxis], baseline, wrap)[0]
+        if C == 4:
+            alpha_up = _bilinear_upsample_2x(tensor[3])
+            base_np = np.concatenate([base_np, alpha_up[np.newaxis]], axis=0)
+        result = base_np
+    elif model.is_3ch:
         # pass all 3 RGB planes together; alpha (if present) bilinear-upscaled separately
         rgb3 = tensor[:3]
         if tile_size is None or tile_size <= 1:
@@ -325,6 +364,9 @@ def process(args: argparse.Namespace):
     net = load_model(args.model, args.wrap)
     print(f"Weights: {args.model}")
 
+    if args.baseline:
+        print(f"Baseline mode: {args.baseline} (neural network bypassed)")
+
     inp = Path(args.input)
 
     if inp.is_file():
@@ -355,7 +397,8 @@ def process(args: argparse.Namespace):
                                    tile_size=args.tile_size,
                                    wrap=args.wrap,
                                    ycgco=args.ycgco,
-                                   yonly=args.yonly)
+                                   yonly=args.yonly,
+                                   baseline=args.baseline)
 
             if args.gridline_removal:
                 result = remove_gridlines(result)
@@ -399,6 +442,8 @@ def main():
     p.add_argument("--ycgco", action="store_true")
     p.add_argument("--yonly", action="store_true")
     p.add_argument("--gridline-removal", action="store_true")
+    p.add_argument("--baseline", choices=BASELINE_MODES, default=None,
+                   help="Debug: use the classical upscaler directly with no neural network")
     p.add_argument("--leaky-slope", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()

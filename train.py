@@ -19,6 +19,7 @@ from model import (UpscaleNet, SigmaBranch, FilterNet, FilterNet2, gaussian_blur
                    manual_downscale2x, upscale_edi_2x, upscale_edi_2x_np,
                    upsample2x, upsample2x_np, jinc_upsample2x_np, box_blur5x5_np)
 
+my_rng = random.Random(42)
 
 # ── loss helpers ──────────────────────────────────────────────────────────────
 
@@ -539,7 +540,7 @@ class UpscaleDataset:
                 self._add_image(hr, n_aug, brightness_range)
             except Exception as e:
                 print(f"  skip {p.name}: {e}")
-        random.shuffle(self.pairs)
+        my_rng.shuffle(self.pairs)
 
     def _add_image(self, hr: np.ndarray, n_aug: int, brightness_range: float):
         lr_box = manual_downscale2x(hr)
@@ -560,20 +561,20 @@ class UpscaleDataset:
 
         total_patches = n_aug * self.precompute_factor * self.patches_per_pair
         for _ in range(total_patches):
-            use_sinc = lr_sinc is not None and random.random() < 0.5
+            use_sinc = lr_sinc is not None and my_rng.random() < 0.5
             lr           = lr_sinc    if use_sinc else lr_box
             baseline_out = baseline_sinc if use_sinc else baseline_box
 
             # crop a patch from the full-resolution arrays
             if lH > ph + 2 * pad and lW > ph + 2 * pad:
-                ly = random.randint(pad, lH - ph - pad - 1)
-                lx = random.randint(pad, lW - ph - pad - 1)
+                ly = my_rng.randint(pad, lH - ph - pad - 1)
+                lx = my_rng.randint(pad, lW - ph - pad - 1)
                 lr_p   = lr          [:, ly - pad : ly + ph + pad, lx - pad : lx + ph + pad]
                 base_p = baseline_out[:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
                 hr_p   = hr          [:, ly * 2   : (ly + ph) * 2, lx * 2   : (lx + ph) * 2]
             elif lH > ph and lW > ph:
-                ly = random.randint(0, lH - ph - 1)
-                lx = random.randint(0, lW - ph - 1)
+                ly = my_rng.randint(0, lH - ph - 1)
+                lx = my_rng.randint(0, lW - ph - 1)
                 lr_p   = lr          [:, ly : ly + ph,       lx : lx + ph      ]
                 base_p = baseline_out[:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
                 hr_p   = hr          [:, ly * 2 : (ly+ph)*2, lx * 2 : (lx+ph)*2]
@@ -582,12 +583,12 @@ class UpscaleDataset:
                 base_p = baseline_out
                 hr_p   = hr
 
-            rot    = random.randint(0, 3)
-            flip   = random.random() > 0.5
-            brightness = random.uniform(0.5, 1.0) if random.random() > 0.5 else 1.0
+            rot    = my_rng.randint(0, 3)
+            flip   = my_rng.random() > 0.5
+            brightness = my_rng.uniform(0.5, 1.0) if my_rng.random() > 0.5 else 1.0
 
             if not self.is_3ch:
-                c = random.randrange(C)
+                c = my_rng.randrange(C)
                 lr_p   = lr_p  [c:c+1]
                 base_p = base_p[c:c+1]
                 hr_p   = hr_p  [c:c+1]
@@ -601,6 +602,12 @@ class UpscaleDataset:
                 a_base = a_base * brightness
                 a_hr   = a_hr   * brightness
 
+            inverted = my_rng.random() < 0.5
+            if inverted:
+                a_lr   = 1.0 - a_lr
+                a_base = 1.0 - a_base
+                a_hr   = 1.0 - a_hr
+            
             residual = a_hr - a_base
 
             self.pairs.append((a_lr, residual, a_base, a_hr))
@@ -690,9 +697,14 @@ def cosine_lr(epoch: int, total_epochs: int, lr_max: float, lr_min: float) -> fl
 # ── training loop ─────────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace):
+    global my_rng
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    my_rng = random.Random(args.seed)
+    Tensor.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
     import model as model_module
     model_module.LEAKY_SLOPE = args.leaky_slope
 
@@ -927,23 +939,24 @@ def train(args: argparse.Namespace):
             adv_val = filter_net(pred_full.detach(), res_batch).detach()
 
             loss_lowpass = lowpassed_l1_loss(pred_full, hr_batch)
-            #pred_down = pred_full.avg_pool2d(2)
-            #hr_down = hr_batch.avg_pool2d(2)
-            #loss_down = (pred_down - hr_down).abs().mean()
             
-            #loss_l1 = (pred - res_batch).abs().mean()
+            #pred_down = pred.avg_pool2d(2)
+            #res_down = res_batch.avg_pool2d(2)
+            #loss_down = (pred_down - res_down).abs().mean()
+            
+            loss_l1 = (pred - res_batch).abs().mean()
             # Intentionally used without sigma branch. We're ONLY interested in the stochastic distribution-retaining
             # properties of lE loss here, so that it doesn't fight against adversarial reconstruction as much.
-            loss_l1 = loss_lE(pred_full, hr_batch)
+            #loss_l1 = loss_lE(pred_full, hr_batch)
 
             gen_loss = (
                   0.3 * adv_loss
-                + 0.3 * loss_depix(pred_full, hr_batch)
+                #+ 0.3 * loss_depix(pred_full, hr_batch)
                 #+ 0.3 * loss_depix_nosub(pred_full, hr_batch)
                 #+ 0.5 * loss_l1
                 + 1.0 * loss_l1
-                #+ 0.9 * loss_down
-                #+ 0.5 * loss_lowpass
+                #+ 3.0 * loss_lowpass
+                + 1.9 * loss_lowpass
                 )
 
             gen_loss.backward()
@@ -1036,6 +1049,10 @@ def train(args: argparse.Namespace):
 
     for epoch in range(start_epoch, args.epochs + 1):
         new_lr = cosine_lr(epoch - 1, args.epochs, args.lr, args.lr * 0.25)
+        # Adversary/discriminator misbehaves if annealed, but generator needs to follow a similar schedule,
+        #  so we need to disable annealing for the GAN loss modes.
+        if use_adv_filter or use_adv_filter2:
+            new_lr = args.lr
         opt.lr = Tensor([new_lr])
         
         #if opt_filter:    
@@ -1048,7 +1065,7 @@ def train(args: argparse.Namespace):
         end_p   = min(start_p + chunk_size, len(dataset.pairs))
 
         indices = list(range(start_p, end_p))
-        random.shuffle(indices)
+        my_rng.shuffle(indices)
 
         running_loss = 0.0
         running_d_pred = 0.0
@@ -1181,7 +1198,7 @@ def main():
     tr.add_argument("data",           help="Folder of high-resolution training images")
     tr.add_argument("--out",          default="upscaler.safetensors")
     tr.add_argument("--resume",       default=None)
-    tr.add_argument("--epochs",            type=int,   default=700)
+    tr.add_argument("--epochs",            type=int,   default=300)
     tr.add_argument("--batch-size",        type=int,   default=32)
     tr.add_argument("--patch-size",        type=int,   default=64)
     tr.add_argument("--n-aug",             type=int,   default=4)
@@ -1199,6 +1216,7 @@ def main():
     tr.add_argument("--clean",             action="store_true", help="Delete all stored filternet weights from checkpoint on load")
     tr.add_argument("--strict-validation", action="store_true")
     tr.add_argument("--val-data",          default=None)
+    tr.add_argument("--seed", type=int, default=42)
 
     # Legacy: if first arg isn't a known subcommand, treat the whole invocation
     # as a bare "train" call so existing scripts keep working.

@@ -102,7 +102,9 @@ Global prefix "j," marks a *jinc-base* model.
 #gConfig = "j,3x3_24,3x3_24,3x3_32,3x3_32,3x3_64,3x3_4"
 #gConfig = "j,3x3_16,3x3_24q,3x3_96d,1x1_24,3x3_32,3x3_56,1x1_4"
 #gConfig = "j,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
-gConfig = "j,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
+#gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
+#gConfig = "b,3x3_9,1x1_6,1x1_4"
+gConfig = "3x3_9,1x1_6,1x1_4"
 #gConfig = "g,3x3_24,3x3_32,3x3_40,3x3_48,3x3_128,1x1_32,1x1_4d"
 #gConfig = "g,3x3_32,3x3_32q,3x3_48,3x3_96,3x3_40,1x1_4"
 
@@ -426,7 +428,9 @@ class UpscaleNet:
             base_np = upsample2x_np(blurred, base_wrap)
         elif self.is_jinc:
             base_np = jinc_upsample2x_np(x_np, base_wrap)
-        elif self.is_bilinear or self.is_raw:
+        elif self.is_bilinear:
+            base_np = upsample2x_np(x_np, base_wrap)
+        elif self.is_raw:
             base_np = upsample2x_np(x_np, base_wrap)
         else:
             base_np = upscale_edi_2x_np(x_np, base_wrap)
@@ -467,24 +471,28 @@ class FilterNet:
         f.weight = f.weight - f.weight.mean(axis=[1,2,3], keepdim=True)
 
     def __init__(self):
-        self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=3)
+        self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=2)
         self.filters2 = Conv2dManual(8, 32, 3, bias=False)
-        self.filters3 = Conv2dManual(32, 32, 3, bias=False, stride=2)
+        self.filters3 = Conv2dManual(32, 32, 3, bias=False)
+        self.filters4 = Conv2dManual(32, 32, 3, bias=False, stride=2)
         self._limit_weights(self.filters)
         self._center_weights(self.filters)
         self._limit_weights(self.filters2)
         self._limit_weights(self.filters3)
+        self._limit_weights(self.filters4)
 
     def normalize_filters(self):
         self._limit_weights(self.filters)
         self._center_weights(self.filters)
         self._limit_weights(self.filters2)
         self._limit_weights(self.filters3)
+        self._limit_weights(self.filters4)
 
     def features(self, x: Tensor) -> Tensor:
         x = self.filters(x).leaky_relu(-0.05)
         x = self.filters2(x).leaky_relu(-0.05)
-        x = self.filters3(x).abs()
+        x = self.filters3(x).leaky_relu(-0.05)
+        x = self.filters4(x).abs()
         return x
     
     def __call__(self, pred: Tensor, target: Tensor) -> Tensor:
@@ -509,7 +517,7 @@ class FilterNet2:
         f.weight = f.weight - f.weight.mean(axis=[1,2,3], keepdim=True)
 
     def __init__(self):
-        self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=3)
+        self.filters  = Conv2dManual(1, 8, 3, bias=False, stride=2)
         self.filters2 = Conv2dManual(8, 24, 3, bias=False)
         self.filters3 = Conv2dManual(24, 8, 3, bias=False, stride=2)
         self._limit_weights(self.filters)
@@ -651,37 +659,40 @@ def upsample2x(t, is_wrapping: bool = False):
     return upsample2x_np(t.astype(np.float32), is_wrapping)
 
 
-_j_kernels = {}
-def _build_jinc_kernel(n_lobes: int) -> np.ndarray:
+_jinc_offset_kernels: dict[tuple[int, float, float], np.ndarray] = {}
+def _build_jinc_kernel_offset(n_lobes: int, dx: float, dy: float) -> np.ndarray:
     """
-    Build a jinc resampling kernel for 2x zero-dilated upscaling.
-    Size: (4*n_lobes) x (4*n_lobes) in dilated-pixel units.
-    A 0.5 dilated-pixel offset is baked in to match pixel-center alignment
-    after zero-dilation (input pixel i placed at dilated position 2i).
-    Window: max(0, 1 - (r/n_lobes)^2) — radial Welch window.
-    Normalized so DC gain = 1 for zero-stuffed 2x upscale (kernel.sum() = 4).
+    Build a jinc resampling kernel with a sub-pixel offset (dx, dy) in input-pixel units.
+    The kernel grid is at integer input-pixel positions; (dx, dy) is the fractional offset
+    from the nearest integer center (e.g. ±0.25 for 2x quarter-phase shifts).
+    Size: (2*n_lobes) x (2*n_lobes) input pixels. Window: radial Welch.
+    Normalized to unit sum.
     """
-    global _j_kernels
-    if n_lobes in _j_kernels:
-        return _j_kernels[n_lobes]
+    global _jinc_offset_kernels
+    key = (n_lobes, dx, dy)
+    if key in _jinc_offset_kernels:
+        return _jinc_offset_kernels[key]
     from scipy.special import j1
-    ks = 4 * n_lobes
-    c = np.arange(ks, dtype=np.float64) - (ks // 2 + 0.5)
-    dy, dx = np.meshgrid(c, c, indexing='ij')
-    r = np.sqrt(dy**2 + dx**2) / 2.0  # input-pixel units, centered on central lobe
+    ks = 2 * n_lobes
+    half = ks // 2
+    c = np.arange(ks, dtype=np.float64) - half  # integer input-pixel coordinates
+    gy, gx = np.meshgrid(c, c, indexing='ij')
+    r = np.sqrt((gx - dx) ** 2 + (gy - dy) ** 2)
     with np.errstate(divide='ignore', invalid='ignore'):
         pr = np.pi * r
         jinc_val = np.where(r < 1e-8, 1.0, 2.0 * j1(pr) / pr)
-    window_r = n_lobes - 0.25  # 0.5 dilated-px shift reduces effective capability radius by 0.25 input px
-    kernel = (jinc_val * np.maximum(0.0, 1.0 - (r / window_r) ** 2)).astype(np.float32)
-    kernel *= 4.0 / kernel.sum()
-    _j_kernels[n_lobes] = kernel
+    kernel = (jinc_val * np.maximum(0.0, 1.0 - (r / n_lobes) ** 2)).astype(np.float32)
+    kernel /= kernel.sum()
+    _jinc_offset_kernels[key] = kernel
     return kernel
 
 
 def jinc_upsample2x_np(t: np.ndarray, is_wrapping: bool = False, n_lobes: int = 4) -> np.ndarray:
     """
-    2x upscale via zero-dilation + jinc-windowed convolution.
+    2x upscale via four quarter-phase-shifted jinc kernels (no dilation).
+    Builds kernels at offsets (±0.25, ±0.25) in input-pixel units (derived
+    from the bilinear pixel-center alignment formula), convolves each with
+    the original grid, and interleaves the results.
     t: (B, C, H, W) or (C, H, W) numpy float32.
     """
     from scipy.ndimage import convolve as nd_convolve
@@ -691,22 +702,29 @@ def jinc_upsample2x_np(t: np.ndarray, is_wrapping: bool = False, n_lobes: int = 
         t = t[np.newaxis]
     B, C, H, W = t.shape
 
-    kernel = _build_jinc_kernel(n_lobes)
-    pad = n_lobes  # input-pixel padding = 2*n_lobes dilated pixels = kernel half-width
+    # Four quarter-phase offsets: for output pixel j at input pos j/2 - 0.25
+    k00 = _build_jinc_kernel_offset(n_lobes, -0.25, -0.25)  # (even, even)
+    k10 = _build_jinc_kernel_offset(n_lobes,  0.25, -0.25)  # (odd,  even)
+    k01 = _build_jinc_kernel_offset(n_lobes, -0.25,  0.25)  # (even, odd)
+    k11 = _build_jinc_kernel_offset(n_lobes,  0.25,  0.25)  # (odd,  odd)
 
+    pad = n_lobes  # kernel half-width in input pixels
     pad_mode = 'wrap' if is_wrapping else 'edge'
-    t_pad = np.pad(t, ((0,0),(0,0),(pad,pad),(pad,pad)), mode=pad_mode)  # (B,C,H+2p,W+2p)
+    t_pad = np.pad(t, ((0, 0), (0, 0), (pad, pad), (pad, pad)), mode=pad_mode)
 
-    pH, pW = H + 2*pad, W + 2*pad
-    dilated = np.zeros((B, C, pH*2, pW*2), dtype=np.float32)
-    dilated[:, :, ::2, ::2] = t_pad
-
-    dp = 2 * pad  # dilated-pixel offset to valid region
-    out = np.empty((B, C, H*2, W*2), dtype=np.float32)
+    out = np.empty((B, C, H * 2, W * 2), dtype=np.float32)
     for b in range(B):
         for c_ in range(C):
-            full = nd_convolve(dilated[b, c_], kernel, mode='constant', cval=0.0)
-            out[b, c_] = full[dp:dp+H*2, dp:dp+W*2]
+            src = t_pad[b, c_]
+            c00 = nd_convolve(src, k00, mode='constant', cval=0.0)[pad:pad + H, pad:pad + W]
+            c10 = nd_convolve(src, k10, mode='constant', cval=0.0)[pad:pad + H, pad:pad + W]
+            c01 = nd_convolve(src, k01, mode='constant', cval=0.0)[pad:pad + H, pad:pad + W]
+            c11 = nd_convolve(src, k11, mode='constant', cval=0.0)[pad:pad + H, pad:pad + W]
+
+            out[b, c_, 0::2, 0::2] = c11
+            out[b, c_, 1::2, 0::2] = c10
+            out[b, c_, 0::2, 1::2] = c01
+            out[b, c_, 1::2, 1::2] = c00
 
     return (out if batched else out[0]).astype(np.float32)
 
