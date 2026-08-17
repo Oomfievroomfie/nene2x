@@ -2,7 +2,7 @@
 
 Super small 2x upscaling neural network.
 
-General architecture: simple ReLU convolutional neural network that upscales an image by 2x. Works as a cleanup pass for a simple upscaler: the network gives you 4 values per input pixel, you use them to push around the 4 pixels produced by the simple upscaler. The simple upscaler may be bilinear, EDI, jinc, blurred bilinear, etc. as specified by the model's configuration.
+General architecture: simple ReLU/LReLU convolutional neural network that upscales an image by 2x. Works as a cleanup pass for a simple upscaler: the network gives you 4 values per input pixel, you use them to push around the 4 pixels produced by the simple upscaler. The simple upscaler may be bilinear, EDI, jinc, blurred bilinear, etc. as specified by the model's configuration.
 
 By default, this is a **single-channel upscaler**. For RGB, my recommendation is to upscale the image in YCgCo instead of RGB. A multichannel mode is supported during model training/creation, but is slower to converge and results in bigger, slower models for the same quality on most inputs; they only help in extreme cases.
 
@@ -49,7 +49,7 @@ For post-processing systems that don't support temporary non-displayed render ta
 
 ## Use as a shader
 
-Run `glsl.py` on one of the networks in `pretrained/` to get a set of GLSL functions that can be ducktaped into any multipass-capable post-processing system (including ones that only allow 1 output texture per pass) to sharpen up a bilinear upscale. See `examples/nn2x.omwfx` as an example of how the ducktaping works. (Note that `omwfx` files don't, at the time of writing, support producing a higher resolution than they take in, so the middle 50% of the input is taken and upscaled, so it's purely for demonstration.)
+Run `glsl.py` on one of the networks in `pretrained/` to get a set of GLSL functions that can be ducktaped into any multipass-capable post-processing system to sharpen up a basic (e.g. bilinear) upscale. Some models are incompatible with some post-processing systems; if you only have one texture output per pass, for example, you can't use models where any non-1x1 layer has more than 4 outputs. See `examples/nn2x.omwfx` as an example of how the ducktaping works. (Note that `omwfx` files don't, at the time of writing, support producing a higher resolution than they take in, so the middle 50% of the input is taken and upscaled, so it's purely for demonstration.)
 
 `glsl.py` is probably slightly outdated and likely to choke on some model topologies. Feel free to update it.
 
