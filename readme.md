@@ -147,7 +147,7 @@ All of the training data under the `train` folders is either public domain (CC0 
 - `train_until_good.py` -- for the initial training run of ultra-small networks that are prone to getting stuck or being unstable
 - `todds.py` -- dds texture compression frontend, for people using infer.py to bulk upscale video game textures
 - `ddslop.py` -- the dds library used by todds because PIL/pillow doesn't support saving dds mipmaps (????? why)
-- `merge.py` -- image frequency band merging script. useful for making the outputs of upscalers with bad baseline information content retention (like ESRGAN) have numbers that are as good as they should be when dumped into comparer.py. without this, upscalers with bad baseline information content retention (like ESRGAN) have worse objective metrics than they should.
+- `merge.py` -- image frequency band merging script. useful for making the outputs of upscalers with bad baseline information content retention (like ESRGAN) have numbers that are as good as they should be when dumped into comparer.py. without this, upscalers with bad baseline information content retention (like ESRGAN) have worse objective metrics than they should. (if you don't do this on your competitors and use the best possible results, you're probably benchmark hacking!)
 - `make_comparison_table.py` -- used to update the readme
 - `train_*/` -- training data. you probably only want train_authentic and train_photo. the other folders are for trial and evaluation runs. use your intuition.
 - `test/` -- raw test images for you to use while adjusting model topology or loss functions.
