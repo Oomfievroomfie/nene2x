@@ -48,7 +48,8 @@ This project uses uv for dependency management; install it first. Don't worry, i
 
 | nn | bilinear | fsr 1.x |
 | --- | --- | --- |
-| ![photo_nn.png](example_outputs/photo_nn.png)<br>PSNR 21.50 / SSIM 0.7609 / LPIPS 0.1453 | ![photo_bilinear.png](example_outputs/photo
+| ![photo_nn.png](example_outputs/photo_nn.png)<br>PSNR 21.50 / SSIM 0.7609 / LPIPS 0.1453 | ![photo_bilinear.png](example_outputs/photo_bilinear.png)<br>PSNR 21.39 / SSIM 0.7076 / LPIPS 0.3332 | ![photo_half_2xfsr.png](example_outputs/photo_half_2xfsr.png)<br>PSNR 22.29 / SSIM 0.7769 / LPIPS 0.2163 |
+
 
 
 ## Pretrained models
