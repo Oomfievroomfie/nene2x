@@ -22,6 +22,8 @@ This project uses uv for dependency management; install it first. Don't worry, i
 
 <!-- PSNR / SSIM: higher is better. LPIPS: lower is better. -->
 
+Done in ycgco mode with the corresponding model and wrapping not enabled.
+
 ### alice
 
 | Original | pico (260 params) | mini (1,536 params) |
