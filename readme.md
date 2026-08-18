@@ -20,9 +20,9 @@ This project uses uv for dependency management; install it first. Don't worry, i
 
 ## Examples
 
-<!-- PSNR / SSIM: higher is better. LPIPS: lower is better. -->
+PSNR / SSIM: higher is better. LPIPS: lower is better. Done in ycgco mode with the corresponding model and wrapping not enabled.
 
-Done in ycgco mode with the corresponding model and wrapping not enabled.
+Results are generally comparable to "Convolutional upscaling Neural Network, yeah!" but slightly noisier because more of the training data is photos.
 
 ### alice
 
@@ -53,8 +53,6 @@ Note: some of the stairstepping artifacts are caused by the 2x downscale being d
 | nn | bilinear | fsr 1.x |
 | --- | --- | --- |
 | ![photo_nn.png](example_outputs/photo_nn.png)<br>PSNR 21.50 / SSIM 0.7609 / LPIPS 0.1453 | ![photo_bilinear.png](example_outputs/photo_bilinear.png)<br>PSNR 21.39 / SSIM 0.7076 / LPIPS 0.3332 | ![photo_half_2xfsr.png](example_outputs/photo_half_2xfsr.png)<br>PSNR 22.29 / SSIM 0.7769 / LPIPS 0.2163 |
-
-
 
 ## Pretrained models
 
@@ -122,12 +120,6 @@ The best loss functions tend to be `--adv-filter-loss`, `--fancy-loss`, and the 
                             Aside from the size, this is a normal GAN in that it tells
                             the upscaler whether its output looks real or not.
 ```
-
-## Results
-
-TODO: automatically take PSNR readings and compare to waifu2x and "Convolutional upscaling Neural Network, yeah!"
-
-Results are generally comparable to "Convolutional upscaling Neural Network, yeah!" but slightly noisier because more of the training data is photos.
 
 ## LLM Usage & Copyright
 
