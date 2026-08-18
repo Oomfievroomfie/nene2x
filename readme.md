@@ -144,7 +144,7 @@ All of the training data under the `train` folders is either public domain (CC0 
 - `train_*/` -- training data. you probably only want train_authentic and train_photo. the other folders are for trial and evaluation runs. use your intuition.
 - `test/` -- raw test images for you to use while adjusting model topology or loss functions.
 - `test_w2x/` -- cherrypicked waifu2x upscales that make waifu2x look as good as possible. can be used as a sanity check on model output quality. remember that waifu2x is a super big model. the variant used for this was the swin-unet photo model, no denoising, 2x, etc.
-- `pretrained_*/` -- pretrained upscaling networks
+- `pretrained_*/` -- pretrained upscaling networks. the general/illustration models were trained with L1 loss (possibly with a couple passes of fancy loss), the photo models were trained with whatever advanced loss functions gave the best lpips and then cleaned up with a small number of weak L1 runs.
 - `fsr/` -- vibecoded fsr 1.x implementation feeding an offline 2x upscaler. matches or slightly outdoes amd's official fsr 1.1 CLI tool. worse than fsr 2.x obviously. fsr 1.x had a very complicated development history so there's no one "canonical version" to compare against; i just made sure it was doing the right things and had good objective metrics on the output.
 - `example_outputs/` -- example images for the readme
 - `examples/` -- other examples
