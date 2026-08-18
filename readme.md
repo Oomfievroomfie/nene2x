@@ -65,9 +65,9 @@ The models are named `nene2x_NAME_DESC`, where DESC has the following syntax (no
 - `b,` -- bilinear base layer
 - `g,` -- blurred bilinear base layer
 - `,` -- new layer
-- 1x1, 3x3, etc. -- receptive field of this layer
-- _12, _16, etc -- number of outputs/channels per pixel going away from this layer
-- _d -- depthwise convolution
+- `1x1`, `3x3`, etc. -- receptive field of this layer
+- `_12`, `_16`, etc -- number of outputs/channels per pixel going away from this layer
+- `_d` -- depthwise convolution
 
 Each non-`1x1` layer requires its own pass, if implemented as a shader. So `nene2x_nano_3x3_4,3x3_9,1x1_9,1x1_4.safetensors` is a 2-pass shader, `nene2x_pico_b,3x3_12,1x1_8,1x1_4.safetensors` is a 1-pass shader, etc.
 
@@ -85,9 +85,9 @@ For post-processing systems that don't support temporary non-displayed render ta
 
 Run `glsl.py` on one of the networks in `pretrained/` to get a set of GLSL functions that can be ducktaped into any multipass-capable post-processing system to sharpen up a basic (e.g. bilinear) upscale. Some models are incompatible with some post-processing systems; if you only have one texture output per pass, for example, you can't use models where any non-1x1 layer has more than 4 inputs per pixel (for example, `3x3_8,1x1_4,3x3_4` is in single-output-texture systems, but not `3x3_8,1x1_8,3x3_4`). See `examples/nn2x.omwfx` as an example of how the ducktaping works. (Note that `omwfx` files don't, at the time of writing, support producing a higher resolution than they take in, so the middle 50% of the input is taken and upscaled, so it's purely for demonstration.)
 
-It's possible to support more complex shader systems, but I don't have any to test, so I haven't tried. If someone wants to get a generator working for magpie or mpv, feel free.
+See `magpie_gen.py` and `magpie_out/` for magpie stuff.
 
-`glsl.py` is probably slightly outdated and likely to choke on some model topologies. Feel free to update it.
+`glsl.py` is probably slightly outdated and likely to choke on some model topologies, also likely to be stupid slow for no reason. Feel free to update it.
 
 ## Training
 
@@ -97,7 +97,7 @@ Modify `model.py` directly to set the network architecture before training. Ther
 
 ## Training Tips
 
-**NOTE IMPORTANTLY:** Some very small network geometries are extremely prone to breaking (getting trapped in bad local minima) on unlucky initializations, such that they fail to stop producing some artifacts during training. For such networks, use `train_until_good.py` to get them started, then resume them with the main training script and `--resume`. Training is done with Leaky ReLUs instead of pure ReLUs to make this problem less common, but it can still happen for extremely small network configurations.
+**NOTE IMPORTANTLY:** Some very small network topologies are extremely prone to breaking (getting trapped in bad local minima) on unlucky initializations, such that they fail to stop producing some artifacts during training. For such networks, use `train_until_good.py` to get them started, then resume them with the main training script and `--resume`. Training is done with Leaky ReLUs instead of pure ReLUs to make this problem less common, but it can still happen for extremely small network configurations.
 
 You may need to change the LReLU slope to have a stable training startup for some network topologies and then reduce it gradually over multiple resumptions. This is a known shortcoming of ultra-small LReLU models and there's not much I can do about it.
 

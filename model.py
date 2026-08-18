@@ -103,8 +103,10 @@ Global prefix "j," marks a *jinc-base* model.
 #gConfig = "j,3x3_16,3x3_24q,3x3_96d,1x1_24,3x3_32,3x3_56,1x1_4"
 #gConfig = "j,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
 #gConfig = "g,3x3_24,3x3_24,3x3_48,3x3_64,3x3_96,1x1_4"
+#gConfig = "g,3x3_20,3x3_24,3x3_32,3x3_24,3x3_4"
+gConfig = "g,3x3_20,3x3_24,3x3_24,3x3_32,1x1_24,3x3_24,1x1_16,3x3_4"
 #gConfig = "b,3x3_9,1x1_6,1x1_4"
-gConfig = "3x3_9,1x1_6,1x1_4"
+#gConfig = "3x3_9,1x1_6,1x1_4"
 #gConfig = "g,3x3_24,3x3_32,3x3_40,3x3_48,3x3_128,1x1_32,1x1_4d"
 #gConfig = "g,3x3_32,3x3_32q,3x3_48,3x3_96,3x3_40,1x1_4"
 
