@@ -38,6 +38,8 @@ This project uses uv for dependency management; install it first. Don't worry, i
 
 ### photo
 
+Note: some of the stairstepping artifacts are caused by the 2x downscale being done with a box filter instead of sinc or jinc. Not all of them, though.
+
 | Original | pico (260 params) | mini (1,536 params) |
 | --- | --- | --- |
 | ![photo_orig.png](example_outputs/photo_orig.png)<br>PSNR ----- / SSIM ------ / LPIPS ------ | ![photo_half_pico2x.png](example_outputs/photo_half_pico2x.png)<br>PSNR 22.64 / SSIM 0.8041 / LPIPS 0.1607 | ![photo_half_mini2x.png](example_outputs/photo_half_mini2x.png)<br>PSNR 22.86 / SSIM 0.8105 / LPIPS 0.1762 |
