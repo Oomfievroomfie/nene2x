@@ -24,11 +24,11 @@ This project uses uv for dependency management; install it first. Don't worry, i
 
 ### alice
 
-| Original | pico | mini |
+| Original | pico (260 params) | mini (1,536 params) |
 | --- | --- | --- |
 | ![alice_orig.png](example_outputs/alice_orig.png)<br>PSNR ----- / SSIM ------ / LPIPS ------ | ![alice_half_pico2x.png](example_outputs/alice_half_pico2x.png)<br>PSNR 36.70 / SSIM 0.9875 / LPIPS 0.0108 | ![alice_half_mini2x.png](example_outputs/alice_half_mini2x.png)<br>PSNR 37.94 / SSIM 0.9904 / LPIPS 0.0111 |
 
-| medium | silly | photo sillyish3 |
+| medium (9,193 params) | silly (95,549 params) | photo sillyish3 (120,165 params) |
 | --- | --- | --- |
 | ![alice_half_med2x.png](example_outputs/alice_half_med2x.png)<br>PSNR 38.89 / SSIM 0.9919 / LPIPS 0.0087 | ![alice_half_silly2x.png](example_outputs/alice_half_silly2x.png)<br>PSNR 39.33 / SSIM 0.9927 / LPIPS 0.0092 | ![alice_half_phsillyish3_2x.png](example_outputs/alice_half_phsillyish3_2x.png)<br>PSNR 37.25 / SSIM 0.9868 / LPIPS 0.0113 |
 
@@ -38,19 +38,17 @@ This project uses uv for dependency management; install it first. Don't worry, i
 
 ### photo
 
-| Original | pico | mini |
+| Original | pico (260 params) | mini (1,536 params) |
 | --- | --- | --- |
 | ![photo_orig.png](example_outputs/photo_orig.png)<br>PSNR ----- / SSIM ------ / LPIPS ------ | ![photo_half_pico2x.png](example_outputs/photo_half_pico2x.png)<br>PSNR 22.64 / SSIM 0.8041 / LPIPS 0.1607 | ![photo_half_mini2x.png](example_outputs/photo_half_mini2x.png)<br>PSNR 22.86 / SSIM 0.8105 / LPIPS 0.1762 |
 
-| medium | silly | photo sillyish3 |
+| medium (9,193 params) | silly (95,549 params) | photo sillyish3 (120,165 params) |
 | --- | --- | --- |
 | ![photo_half_med2x.png](example_outputs/photo_half_med2x.png)<br>PSNR 23.09 / SSIM 0.8223 / LPIPS 0.1602 | ![photo_half_silly2x.png](example_outputs/photo_half_silly2x.png)<br>PSNR 22.74 / SSIM 0.8132 / LPIPS 0.1276 | ![photo_half_phsillyish3_2x.png](example_outputs/photo_half_phsillyish3_2x.png)<br>PSNR 21.94 / SSIM 0.7781 / LPIPS 0.0887 |
 
 | nn | bilinear | fsr 1.x |
 | --- | --- | --- |
-| ![photo_nn.png](example_outputs/photo_nn.png)<br>PSNR 21.50 / SSIM 0.7609 / LPIPS 0.1453 | ![photo_bilinear.png](example_outputs/photo_bilinear.png)<br>PSNR 21.39 / SSIM 0.7076 / LPIPS 0.3332 | ![photo_half_2xfsr.png](example_outputs/photo_half_2xfsr.png)<br>PSNR 22.29 / SSIM 0.7769 / LPIPS 0.2163 |
-
-
+| ![photo_nn.png](example_outputs/photo_nn.png)<br>PSNR 21.50 / SSIM 0.7609 / LPIPS 0.1453 | ![photo_bilinear.png](example_outputs/photo
 
 
 ## Pretrained models
