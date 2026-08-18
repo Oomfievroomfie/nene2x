@@ -64,6 +64,8 @@ For post-processing systems that don't support temporary non-displayed render ta
 
 Run `glsl.py` on one of the networks in `pretrained/` to get a set of GLSL functions that can be ducktaped into any multipass-capable post-processing system to sharpen up a basic (e.g. bilinear) upscale. Some models are incompatible with some post-processing systems; if you only have one texture output per pass, for example, you can't use models where any non-1x1 layer has more than 4 outputs. See `examples/nn2x.omwfx` as an example of how the ducktaping works. (Note that `omwfx` files don't, at the time of writing, support producing a higher resolution than they take in, so the middle 50% of the input is taken and upscaled, so it's purely for demonstration.)
 
+It's possible to support more complex shader systems, but I don't have any to test, so I haven't tried. If someone wants to get a generator working for magpie or mpv, feel free.
+
 `glsl.py` is probably slightly outdated and likely to choke on some model topologies. Feel free to update it.
 
 ## Training
