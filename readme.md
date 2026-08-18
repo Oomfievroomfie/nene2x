@@ -137,6 +137,26 @@ The code in this repository is heavily full of LLM boilerplate and has many func
 
 All of the training data under the `train` folders is either public domain (CC0 images from Flickr) or authored by myself.
 
+## List of stuff
+
+- train.py -- for orchestrating training/resumption
+- model.py -- core of the whole thing
+- infer.py -- command line image upscaler and a couple of related tools
+- comparer.py -- objective baseline-driven image quality metric reporter
+- glsl.py -- (incomplete) glsl function generator for simple models. might generate badly-structured glsl code (e.g. it's possible that it matmuls in the wrong order or orientation for cache coherency or something), i'm not an expert and don't know if there's any specific structure i need to prompt for.
+- train_until_good.py -- for the initial training run of ultra-small networks that are prone to getting stuck or being unstable
+- todds.py -- dds texture compression frontend, for people using infer.py to bulk upscale video game textures
+- ddslop.py -- the dds library used by todds because PIL/pillow doesn't support saving dds mipmaps (????? why)
+- merge.py -- image frequency band merging script. useful for making the outputs of upscalers with bad baseline information content retention (like ESRGAN) have numbers that are as good as they should be when dumped into comparer.py. without this, upscalers with bad baseline information content retention (like ESRGAN) have worse objective metrics than they should.
+- make_comparison_table.py -- used to update the readme
+- train_*/ -- training data. you probably only want train_authentic and train_photo. the other folders are for trial and evaluation runs. use your intuition.
+- test/ -- raw test images for you to use while adjusting model topology or loss functions.
+- test_w2x/ -- cherrypicked waifu2x upscales that make waifu2x look as good as possible. can be used as a sanity check on model output quality. remember that waifu2x is a super big model. the variant used for this was the swin-unet photo model, no denoising, 2x, etc.
+- pretrained_*/ -- pretrained upscaling networks
+- fsr/ -- vibecoded fsr 1.x implementation feeding an offline 2x upscaler. matches or slightly outdoes amd's official fsr 1.1 CLI tool. worse than fsr 2.x obviously. fsr 1.x had a very complicated development history so there's no one "canonical version" to compare against; i just made sure it was doing the right things and had good objective metrics on the output.
+- example_outputs/ -- example images for the readme
+- examples/ -- other examples
+
 ## License
 
 All code and model data in this repo is licensed under your choice of:
