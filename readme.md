@@ -123,6 +123,8 @@ Depending on the dataset and intended distribution of upscaled images, the best 
 
 `--adv-filter-loss` can be tuned with `--adv-loss-weight X`; the default weight is 0.3. The default weight of 0.3 is very aggressive and leads noisy oversharpening and strong edge-chckerboards on clean illustrations for most model sizes, especially very small ones, and even some photos with particularly clean feature boundaries (e.g. dark building vs bright sky). This tuning is best for photo-based texture images (e.g. as used in games) but for other data distributions you want a smaller weight.
 
+Most of the models in the pretrained folders were trained using the default L1 loss, *maybe* le loss. A couple of the photo models were trained with adversarial filter loss or fancy loss, sometimes fine tuned back and forth with L1 loss while staring at specific image outputs. Not entirely reproducible.
+
 ## LLM Usage & Copyright
 
 The architecture of the networks being trained was decided by myself and not the LLM. This readme was written entirely by myself.
