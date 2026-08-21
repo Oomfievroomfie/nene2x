@@ -105,7 +105,7 @@ For extremely large networks, it's beneficial to switch back and forth (resuming
 
 If you're using `--adv-filter2-loss`, it's basically a microscopic GAN, but because it's so small, it's prone to learning to emit speckles and hard edge lines. Fine tuning at the very end of training with fancy loss for 5 epochs and a los learning rate can reduce them, but make a bcakup first: `--fancy-loss --epochs 5 --lr 0.00004`
 
-The best loss functions tend to be `--adv-filter-loss`, `--fancy-loss`, and the default/unspecified (which is either L1 or L2, probably L1, but I didn't double check). `--le-loss` works but is slow and almost indistinguishable from the default L1 loss. adv-filter2-loss is good for short runs but tends to degenerate and start generating artifacts on long runs, especially on medium-sized models.
+Depending on the dataset and intended distribution of upscaled images, the best loss functions tend to be the default (L1 loss), `--adv-filter-loss`, and `--fancy-loss`. The default is better for clean datasets with less high-frequency detail and the filter/fancy losses are better for photographs. `--le-loss` works but is slow and almost indistinguishable from the default L1 loss. adv-filter2-loss is good for short runs but tends to degenerate and start generating artifacts on long runs, especially on medium/large-sized models.
 
 ```
     --fancy-loss         - Loss uses high-freq feature vectors to punish blurry output.
@@ -120,6 +120,8 @@ The best loss functions tend to be `--adv-filter-loss`, `--fancy-loss`, and the 
                             Aside from the size, this is a normal GAN in that it tells
                             the upscaler whether its output looks real or not.
 ```
+
+`--adv-filter-loss` can be tuned with `--adv-loss-weight X`; the default weight is 0.3. The default weight of 0.3 is very aggressive and leads noisy oversharpening and strong edge-chckerboards on clean illustrations for most model sizes, especially very small ones, and even some photos with particularly clean feature boundaries (e.g. dark building vs bright sky). This tuning is best for photo-based texture images (e.g. as used in games) but for other data distributions you want a smaller weight.
 
 ## LLM Usage & Copyright
 
